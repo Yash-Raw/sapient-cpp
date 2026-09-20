@@ -84,3 +84,29 @@ publish-dry:
     cargo publish -p sapient-telemetry    --dry-run
     cargo publish -p sapient-runtime      --dry-run
     cargo publish -p sapient-cli          --dry-run
+
+# ── C++ tree (cpp/) — Rust→C++ parity port ─────────────────────────────────────
+# Configure the C++ tree (presets: dev, release, ci-macos, ci-linux, ci-windows)
+cpp-configure preset="dev":
+    cd cpp && cmake --preset {{preset}}
+
+# Build the C++ tree
+cpp-build preset="dev":
+    cd cpp && cmake --build --preset {{preset}}
+
+# Run the C++ tests (set SAPIENT_GOLDEN_DIR to include the kernel golden gate)
+cpp-test preset="dev":
+    cd cpp && ctest --preset {{preset}}
+
+# Format the C++ sources in place
+cpp-fmt:
+    git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs clang-format -i
+
+# Lint gates that need no build: SPDX headers (both trees) + WGSL shader sync
+cpp-lint:
+    python3 cpp/scripts/check_spdx.py cpp crates
+    python3 cpp/scripts/shader_sync.py .
+
+# Regenerate the kernel golden dumps on this host with the Rust oracle
+cpp-golden out="/tmp/sapient-golden":
+    cpp/tests/parity/golden_dump.sh {{out}}

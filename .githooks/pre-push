@@ -35,5 +35,16 @@ if ! cargo clippy --workspace --all-targets -- -D warnings; then
   exit 1
 fi
 
+# C++ tree: clang-format dry run (only when clang-format is installed).
+if [ -d cpp ] && command -v clang-format >/dev/null 2>&1; then
+  echo "pre-push: clang-format --dry-run over cpp/…"
+  cpp_files=$(git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm')
+  if [ -n "$cpp_files" ] && ! echo "$cpp_files" | xargs clang-format --dry-run --Werror; then
+    echo "" >&2
+    echo "pre-push: clang-format violations in cpp/ — run 'just cpp-fmt', commit, then push again." >&2
+    exit 1
+  fi
+fi
+
 echo "pre-push: lint clean ✓"
 exit 0
