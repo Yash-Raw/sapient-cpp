@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Branch:** work on `feat/cpp-sp0-scaffold`, created from `feat/cpp-rewrite-spec` (Task 1 step 1). Commit after every task; do not push (the pre-push hook runs cargo fmt/clippy and, after Task 7, clang-format).
+- **Branch:** work on `feat/cpp-sp0-scaffold`, created from `feat/cpp-rewrite-spec` (Task 1 step 1). Commit after every task; **never push** — the user pushes and opens the PR after Task 8 (the pre-push hook then runs cargo fmt/clippy and clang-format).
 - **Compiler:** Clang only for parity builds — `CMAKE_CXX_COMPILER_ID` must match `Clang` (covers `AppleClang` and clang-cl); CMake hard-fails otherwise unless `-DSAPIENT_ALLOW_NON_CLANG=ON` (spec D1/D3, decision 4).
 - **Flags:** `-ffp-contract=off` (clang-cl: `/clang:-ffp-contract=off`) applied globally; configure fails if `CMAKE_CXX_FLAGS` contains `-march=native`, `-ffast-math` or `-Ofast`. Tests build at `-O1` (mirrors `[profile.test] opt-level = 1`).
 - **Standard/build:** `CMAKE_CXX_STANDARD 20`, extensions OFF, CMake ≥ 3.24, Ninja generator in every preset.
@@ -2236,7 +2236,7 @@ git commit -m "docs(sp0): C++ build/test/lint instructions, spec amendment, road
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
-Then open the PR from `feat/cpp-sp0-scaffold` (the push triggers the five new CI jobs; all must be green — that is sub-project 0's gate per spec §D5).
+**Do NOT push.** The user pushes `feat/cpp-sp0-scaffold` and opens the PR themselves; the five new CI jobs going green on that PR is sub-project 0's gate per spec §D5. Report the branch state and stop.
 
 ---
 
