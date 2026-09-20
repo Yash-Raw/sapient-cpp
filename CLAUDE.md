@@ -337,6 +337,17 @@ GGUFs without an embedded/HF chat template get a builtin guessed from arch + mod
 - **SAPIENT is NOT published to crates.io.** Distribution is prebuilt GitHub release binaries (+ install script / Homebrew). The previously-published crates (0.1.11–0.3.1) have been yanked; `scripts/yank-all.sh` (idempotent, `--undo` to reverse) manages crates.io yanks. Do not re-introduce a publish step.
 
 
+## C++ rewrite programme (in progress since 2026-09-20)
+
+The workspace is being converted from Rust to C++ **as a parity port, not a redesign**. Design spec (approved): `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`. Rules that bind every C++ change:
+- **Side-by-side:** the C++ tree lives under `cpp/`; `crates/` stays building as the correctness oracle until every parity gate has passed (sub-project 9 removes it). Rust behaviour is frozen meanwhile — the only Rust addition allowed is the test-only kernel golden-dump example.
+- **Toolchain:** C++20, CMake ≥3.24, **Clang everywhere (clang-cl on Windows)**, `-ffp-contract=off`, no `-march=native` / `-ffast-math` — bit-identity of the quant kernels vs the Rust build depends on these.
+- **Mirror, don't extend:** one CMake target per Rust crate (same name, namespace `sapient::<crate>`), one `.hpp/.cpp` per `.rs` module with the same stem, same test names, same `SAPIENT_*` env knobs, per-ISA SIMD dispatch table copied exactly (x86 K-quants stay scalar until parity is recorded).
+- **Third-party map:** SAPIENT-authored code is hand-converted; crates map to C++ libraries (nlohmann/json, CLI11, cpp-httplib, libcurl, minja for chat templates, an own `tokenizer.json` engine + PCRE2, wgpu-native so the WGSL shaders ship unchanged, the MLX C++ API, miniaudio, pocketfft, dr_libs, …). Full table in spec §D4.
+- **Gates:** kernel golden dumps (bit-identical, generated per host in CI), greedy token-identical decode vs the Rust binary, fixtures reused byte-for-byte; results recorded in `docs/PARITY.md`.
+- **Order:** 0 scaffold → 1a core/io/cpu kernels → 1b CPU `chat` vertical slice → 2 text engines → 3 hub/CLI/serve → 4 GPU → 5a/5b/5c audio → 6 vision → 7 FFI/mobile → 8 dead IR path → 9 docs/release/Rust removal.
+- SPDX header (same two lines) on every `.hpp/.cpp/.mm/.wgsl`; `#` form on CMake/sh/py — enforced by a CI gate over `cpp/`.
+
 ## Must follow
 
 - always update the docs/PROJECT_GUIDE.md file when making changes to the codebase and keep it updated with the latest changes.

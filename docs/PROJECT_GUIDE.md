@@ -95,6 +95,10 @@ safe-testing ladder live in `docs/MOBILE.md`.
 
 ---
 
+### The C++ rewrite (started 2026-09-20)
+
+SAPIENT is being converted from Rust to C++ as a like-for-like port. Nothing about how it *works* changes — same quantized kernels, same engines, same commands — only the implementation language. The C++ code lives in `cpp/` next to the Rust `crates/`, and the Rust build stays as the "answer key" every C++ piece is checked against until the port is complete. The full design (what maps to what, in what order, and how each step is verified) is in `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`. This guide's crate-by-crate sections (§4–§7) describe the Rust tree and will be rewritten for C++ in the final sub-project.
+
 ## 2. How does the parrot actually "think"? (still pretty simple)
 
 The parrot doesn't know words. It only knows **numbers**. So we play a translation game:

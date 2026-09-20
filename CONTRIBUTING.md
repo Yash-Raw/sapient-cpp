@@ -570,6 +570,14 @@ Do **not** use `raw.githubusercontent.com/.../main/install.sh` in user-facing do
 
 ---
 
+## C++ rewrite programme (in progress)
+
+The workspace is being ported to C++ (`cpp/`, C++20 + CMake, Clang) as a behavioural-parity conversion; the Rust `crates/` remain the correctness oracle until the port is complete. Before contributing to either tree, read `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`:
+
+- **Rust tree:** behaviour is frozen (bug fixes only, each mirrored in C++); do not change kernel numerics without updating the parity records.
+- **C++ tree:** follow the mirroring conventions (same crate/module/test names, same env knobs, `-ffp-contract=off`, no `-march=native`), keep the SPDX header on every file, and land each change with its parity-gate result in `docs/PARITY.md`.
+- The build/test/lint sections above describe the Rust tree; the C++ equivalents (`cmake --preset dev && ctest --preset dev`, clang-format, clang-tidy) are documented as sub-project 0 lands.
+
 ## Getting help
 
 - **Bug reports & feature requests:** [GitHub Issues](https://github.com/SkidGod4444/sapient/issues)
