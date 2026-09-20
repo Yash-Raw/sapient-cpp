@@ -61,3 +61,11 @@ add_subdirectory(libs/sapient-core)
 if(SAPIENT_BUILD_TESTS)
   add_subdirectory(libs/sapient-testing)
 endif()
+
+if(SAPIENT_BUILD_TESTS)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME lint.spdx_headers
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_spdx.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME lint.shader_sync
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/shader_sync.py ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()

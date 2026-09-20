@@ -4,6 +4,8 @@
 
 namespace sapient::core {
 
-std::string_view version() noexcept { return SAPIENT_VERSION_STRING; }
+std::string_view version() noexcept {
+    return SAPIENT_VERSION_STRING;
+}
 
-}  // namespace sapient::core
+} // namespace sapient::core

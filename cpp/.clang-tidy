@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
+# The C++ analogue of `cargo clippy -- -D warnings`: a curated, low-noise set, all errors.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-using,
+  readability-container-size-empty,
+  readability-redundant-string-cstr,
+  misc-unused-using-decls
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/cpp/(libs|apps|ffi)/.*'
+FormatStyle: file

@@ -25,7 +25,9 @@ TEST(Version, IsSemver) {
 // Exercises the real extraction path: reads the same file CMake read and compares.
 TEST(Version, MatchesWorkspaceCargoToml) {
     std::ifstream in(SAPIENT_CARGO_TOML_PATH);
-    if (!in) GTEST_SKIP() << "no ../Cargo.toml (Rust tree removed) — version now comes from -DSAPIENT_VERSION";
+    if (!in)
+        GTEST_SKIP()
+            << "no ../Cargo.toml (Rust tree removed) — version now comes from -DSAPIENT_VERSION";
     const std::string toml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     // Custom raw-string delimiter (`re`): the pattern's own trailing `)"`  (capture-group
     // close + literal closing quote) would otherwise collide with the default `)"` raw-string

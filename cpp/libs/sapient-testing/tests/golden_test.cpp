@@ -19,7 +19,9 @@ using sapient::testing::read_golden;
 
 namespace {
 
-fs::path fixtures() { return fs::path(SAPIENT_TESTING_FIXTURES_DIR); }
+fs::path fixtures() {
+    return fs::path(SAPIENT_TESTING_FIXTURES_DIR);
+}
 
 fs::path temp_file(const char* stem) {
     return fs::temp_directory_path() / (std::string("sapient_golden_") + stem + ".sapd");
@@ -27,7 +29,8 @@ fs::path temp_file(const char* stem) {
 
 void write_bytes(const fs::path& p, const std::vector<uint8_t>& bytes) {
     std::ofstream out(p, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
 }
 
 std::vector<uint8_t> read_bytes(const fs::path& p) {
@@ -37,11 +40,13 @@ std::vector<uint8_t> read_bytes(const fs::path& p) {
 
 // Tiny little-endian appenders for hand-building a .sapd byte buffer — no new dependencies.
 void put_u32(std::vector<uint8_t>& buf, uint32_t v) {
-    for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    for (int i = 0; i < 4; ++i)
+        buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
 }
 
 void put_u64(std::vector<uint8_t>& buf, uint64_t v) {
-    for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    for (int i = 0; i < 8; ++i)
+        buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
 }
 
 void put_str(std::vector<uint8_t>& buf, const std::string& s) {
@@ -49,7 +54,7 @@ void put_str(std::vector<uint8_t>& buf, const std::string& s) {
     buf.insert(buf.end(), s.begin(), s.end());
 }
 
-}  // namespace
+} // namespace
 
 TEST(Golden, ReadsFormatSampleWrittenByRust) {
     std::string err;
@@ -73,7 +78,7 @@ TEST(Golden, ReadsFormatSampleWrittenByRust) {
     EXPECT_EQ(c->get("out:empty").numel(), 0u);
     EXPECT_EQ(c->find("does-not-exist"), nullptr);
     EXPECT_THROW(c->get("does-not-exist"), std::out_of_range);
-    EXPECT_THROW(c->get("in:f32").as<uint8_t>(), std::logic_error);  // element size mismatch
+    EXPECT_THROW(c->get("in:f32").as<uint8_t>(), std::logic_error); // element size mismatch
 }
 
 TEST(Golden, RejectsBadMagic) {
@@ -111,14 +116,14 @@ TEST(Golden, RejectsImplausibleLengthFields) {
     {
         std::vector<uint8_t> buf;
         buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
-        put_u32(buf, 1);                      // version
-        put_str(buf, "x");                    // case name
-        put_u32(buf, 1);                      // n_arrays
-        put_str(buf, "in:a");                 // array name
-        buf.push_back(0);                     // dtype = F32
-        put_u32(buf, 1);                      // ndim
-        put_u64(buf, 1);                      // dims[0]
-        put_u64(buf, 0xFFFFFFFFFFFFFFF0ULL);  // byte_len — implausible, no payload follows
+        put_u32(buf, 1);                     // version
+        put_str(buf, "x");                   // case name
+        put_u32(buf, 1);                     // n_arrays
+        put_str(buf, "in:a");                // array name
+        buf.push_back(0);                    // dtype = F32
+        put_u32(buf, 1);                     // ndim
+        put_u64(buf, 1);                     // dims[0]
+        put_u64(buf, 0xFFFFFFFFFFFFFFF0ULL); // byte_len — implausible, no payload follows
         const auto p = temp_file("hugelen");
         write_bytes(p, buf);
         std::string err;
@@ -131,12 +136,12 @@ TEST(Golden, RejectsImplausibleLengthFields) {
     {
         std::vector<uint8_t> buf;
         buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
-        put_u32(buf, 1);              // version
-        put_str(buf, "x");            // case name
-        put_u32(buf, 1);              // n_arrays
-        put_str(buf, "in:a");         // array name
-        buf.push_back(0);             // dtype = F32
-        put_u32(buf, 0xFFFFFFFFu);    // ndim — implausible
+        put_u32(buf, 1);           // version
+        put_str(buf, "x");         // case name
+        put_u32(buf, 1);           // n_arrays
+        put_str(buf, "in:a");      // array name
+        buf.push_back(0);          // dtype = F32
+        put_u32(buf, 0xFFFFFFFFu); // ndim — implausible
         const auto p = temp_file("hugendim");
         write_bytes(p, buf);
         std::string err;
@@ -151,15 +156,15 @@ TEST(Golden, RejectsImplausibleLengthFields) {
     {
         std::vector<uint8_t> buf;
         buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
-        put_u32(buf, 1);                        // version
-        put_str(buf, "x");                      // case name
-        put_u32(buf, 1);                        // n_arrays
-        put_str(buf, "in:a");                   // array name
-        buf.push_back(0);                       // dtype = F32
-        put_u32(buf, 1);                        // ndim
-        put_u64(buf, 0x4000000000000001ULL);    // dims[0] = 2^62 + 1
-        put_u64(buf, 4);                        // byte_len — small, matches a 4-byte payload
-        buf.insert(buf.end(), {0, 0, 0, 0});    // 4 payload bytes
+        put_u32(buf, 1);                     // version
+        put_str(buf, "x");                   // case name
+        put_u32(buf, 1);                     // n_arrays
+        put_str(buf, "in:a");                // array name
+        buf.push_back(0);                    // dtype = F32
+        put_u32(buf, 1);                     // ndim
+        put_u64(buf, 0x4000000000000001ULL); // dims[0] = 2^62 + 1
+        put_u64(buf, 4);                     // byte_len — small, matches a 4-byte payload
+        buf.insert(buf.end(), {0, 0, 0, 0}); // 4 payload bytes
         const auto p = temp_file("hugenumelbytesize");
         write_bytes(p, buf);
         std::string err;
@@ -174,7 +179,8 @@ TEST(Golden, RejectsImplausibleLengthFields) {
 TEST(Golden, InventoryFromEnv) {
     const char* dir = std::getenv("SAPIENT_GOLDEN_DIR");
     if (dir == nullptr) {
-        GTEST_SKIP() << "SAPIENT_GOLDEN_DIR not set — run cpp/tests/parity/golden_dump.sh <dir> and export it";
+        GTEST_SKIP() << "SAPIENT_GOLDEN_DIR not set — run cpp/tests/parity/golden_dump.sh <dir> "
+                        "and export it";
     }
     const auto files = list_golden(dir);
     ASSERT_FALSE(files.empty()) << "no *.sapd files in " << dir;
@@ -184,7 +190,8 @@ TEST(Golden, InventoryFromEnv) {
         ASSERT_TRUE(c.has_value()) << f << ": " << err;
         EXPECT_EQ(c->name, f.stem().string()) << f;
         bool has_out = false;
-        for (const auto& a : c->arrays) has_out = has_out || a.name.starts_with("out:");
+        for (const auto& a : c->arrays)
+            has_out = has_out || a.name.starts_with("out:");
         EXPECT_TRUE(has_out) << f << " has no out: array";
     }
     std::printf("golden inventory: %zu cases in %s\n", files.size(), dir);

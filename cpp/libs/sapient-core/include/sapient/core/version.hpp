@@ -9,4 +9,4 @@ namespace sapient::core {
 /// Engine version — mirrors the Rust workspace `[workspace.package] version`.
 std::string_view version() noexcept;
 
-}  // namespace sapient::core
+} // namespace sapient::core

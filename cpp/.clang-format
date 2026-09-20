@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
+# Mirrors rustfmt's look (4-space indent, 100 columns) so Rust↔C++ diffs read side by side.
+BasedOnStyle: LLVM
+Standard: c++20
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Attach
+# The SPDX copyright line is 107 chars (over ColumnLimit) by design (see check_spdx.py) — without
+# this, LLVM style's default ReflowComments wraps it onto a third line and breaks the SPDX gate.
+ReflowComments: false
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+IncludeCategories:
+  - Regex: '^<gtest/'
+    Priority: 1
+  - Regex: '^<[a-z_]+>$'
+    Priority: 2
+  - Regex: '^"sapient/'
+    Priority: 4
+  - Regex: '.*'
+    Priority: 3

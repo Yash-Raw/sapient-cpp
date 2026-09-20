@@ -7,7 +7,8 @@
 #include <fstream>
 #include <iterator>
 
-static_assert(std::endian::native == std::endian::little, "the .sapd reader assumes a little-endian host");
+static_assert(std::endian::native == std::endian::little,
+              "the .sapd reader assumes a little-endian host");
 
 namespace sapient::testing {
 
@@ -27,8 +28,7 @@ struct Cursor {
     // near SIZE_MAX, so `pos + n` would silently wrap and this would wrongly report `true`.
     bool has(size_t n) const { return pos <= buf.size() && n <= buf.size() - pos; }
 
-    template <class T>
-    bool read(T& out) {
+    template <class T> bool read(T& out) {
         if (!has(sizeof(T))) return false;
         std::memcpy(&out, buf.data() + pos, sizeof(T));
         pos += sizeof(T);
@@ -73,7 +73,7 @@ bool checked_numel(const std::vector<uint64_t>& dims, size_t& out) {
     return true;
 }
 
-}  // namespace
+} // namespace
 
 size_t dtype_size(GoldenDType dtype) {
     switch (dtype) {
@@ -92,7 +92,8 @@ size_t dtype_size(GoldenDType dtype) {
 
 size_t GoldenArray::numel() const {
     size_t n = 1;
-    for (const auto d : dims) n *= static_cast<size_t>(d);
+    for (const auto d : dims)
+        n *= static_cast<size_t>(d);
     return dims.empty() ? 1 : n;
 }
 
@@ -105,7 +106,9 @@ const GoldenArray* GoldenCase::find(std::string_view array_name) const {
 
 const GoldenArray& GoldenCase::get(std::string_view array_name) const {
     const auto* a = find(array_name);
-    if (a == nullptr) throw std::out_of_range("golden case '" + name + "' has no array '" + std::string(array_name) + "'");
+    if (a == nullptr)
+        throw std::out_of_range("golden case '" + name + "' has no array '" +
+                                std::string(array_name) + "'");
     return *a;
 }
 
@@ -115,7 +118,8 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
         set_error(error, "cannot open " + file.string());
         return std::nullopt;
     }
-    const std::vector<uint8_t> buf{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::vector<uint8_t> buf{std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>()};
     Cursor cur{buf};
 
     if (buf.size() < 4 || std::memcmp(buf.data(), "SAPD", 4) != 0) {
@@ -154,12 +158,16 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
             return std::nullopt;
         }
         if (tag > static_cast<uint8_t>(GoldenDType::U64)) {
-            set_error(error, file.string() + ": unknown dtype tag " + std::to_string(tag) + " in " + a.name);
+            set_error(error,
+                      file.string() + ": unknown dtype tag " + std::to_string(tag) + " in " +
+                          a.name);
             return std::nullopt;
         }
         a.dtype = static_cast<GoldenDType>(tag);
         if (ndim > kMaxDims) {
-            set_error(error, file.string() + ": implausible ndim " + std::to_string(ndim) + " in " + a.name);
+            set_error(error,
+                      file.string() + ": implausible ndim " + std::to_string(ndim) + " in " +
+                          a.name);
             return std::nullopt;
         }
         a.dims.resize(ndim);
@@ -188,7 +196,8 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
             return std::nullopt;
         }
         if (a.bytes.size() != expected_numel * es) {
-            set_error(error, file.string() + ": byte length does not match dims×dtype in " + a.name);
+            set_error(error,
+                      file.string() + ": byte length does not match dims×dtype in " + a.name);
             return std::nullopt;
         }
         c.arrays.push_back(std::move(a));
@@ -210,4 +219,4 @@ std::vector<std::filesystem::path> list_golden(const std::filesystem::path& dir)
     return out;
 }
 
-}  // namespace sapient::testing
+} // namespace sapient::testing

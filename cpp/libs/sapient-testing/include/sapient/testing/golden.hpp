@@ -27,7 +27,7 @@ enum class GoldenDType : uint8_t { F32 = 0, U8 = 1, I8 = 2, I32 = 3, U32 = 4, U6
 size_t dtype_size(GoldenDType dtype);
 
 struct GoldenArray {
-    std::string name;  // "in:x", "param:eps", "out:y", …
+    std::string name; // "in:x", "param:eps", "out:y", …
     GoldenDType dtype{GoldenDType::F32};
     std::vector<uint64_t> dims;
     std::vector<uint8_t> bytes;
@@ -35,8 +35,7 @@ struct GoldenArray {
     size_t numel() const;
 
     /// Decode the payload as a vector of T (copy; T must match the dtype's element size).
-    template <class T>
-    std::vector<T> as() const {
+    template <class T> std::vector<T> as() const {
         if (sizeof(T) != dtype_size(dtype)) {
             throw std::logic_error("GoldenArray::as<T>: element size mismatch for " + name);
         }
@@ -56,9 +55,10 @@ struct GoldenCase {
 };
 
 /// Parse one dump file. On failure returns nullopt and, if `error` is non-null, a reason.
-std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::string* error = nullptr);
+std::optional<GoldenCase> read_golden(const std::filesystem::path& file,
+                                      std::string* error = nullptr);
 
 /// All `*.sapd` files in `dir`, sorted by path. Empty if `dir` does not exist.
 std::vector<std::filesystem::path> list_golden(const std::filesystem::path& dir);
 
-}  // namespace sapient::testing
+} // namespace sapient::testing
