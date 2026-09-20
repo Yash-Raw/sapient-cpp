@@ -30,6 +30,7 @@
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
     { "name": "ci-macos", "configurePreset": "ci-macos", "output": { "outputOnFailure": true } },
     { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } },
     { "name": "ci-windows", "configurePreset": "ci-windows", "output": { "outputOnFailure": true } }

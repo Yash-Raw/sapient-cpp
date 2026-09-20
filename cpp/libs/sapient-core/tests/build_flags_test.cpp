@@ -25,3 +25,29 @@ TEST(BuildFlags, FpContractIsOff) {
     // Sanity: a real FMA does differ on these inputs, so the assertion above is meaningful.
     EXPECT_NE(std::fma(static_cast<float>(a), static_cast<float>(b), static_cast<float>(c)), 0.0f);
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+// On x86-64 BASELINE (no target attribute), clang cannot contract a*b+c into an FMA even with
+// -ffp-contract=on: the baseline ISA has no fma instruction to contract into, so the plain
+// BuildFlags.FpContractIsOff test above would pass on x86-64 even with -ffp-contract=off
+// missing from the build — it is not testing anything there. 1a's real AVX2/FMA kernels live in
+// functions marked `__attribute__((target("avx2,fma")))`, where the fma instruction IS
+// available, so THIS is the honest gate for those translation units: it reproduces the same
+// target-attribute context and checks -ffp-contract=off still holds inside it. clang-cl accepts
+// the same `__attribute__((target(...)))` syntax as clang, so no #ifdef is needed per frontend.
+__attribute__((target("fma"))) float fma_target_probe() {
+    volatile float a = 1.0f + 0x1p-23f;
+    volatile float b = 1.0f - 0x1p-23f;
+    volatile float c = -1.0f;
+    return a * b + c;
+}
+
+TEST(BuildFlags, FpContractIsOffUnderFmaTarget) {
+    if (!__builtin_cpu_supports("fma")) {
+        GTEST_SKIP() << "host has no FMA";
+    }
+    EXPECT_EQ(fma_target_probe(), 0.0f)
+        << "a*b+c was contracted into an FMA inside a target(\"fma\") function: "
+           "-ffp-contract=off must hold even where the ISA has an fma instruction to use";
+}
+#endif

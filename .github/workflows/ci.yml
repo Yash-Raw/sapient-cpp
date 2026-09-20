@@ -226,7 +226,7 @@ jobs:
         working-directory: cpp
         run: |
           cmake --preset ci-linux -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
-          run-clang-tidy-18 -p build/ci-linux -quiet libs/
+          run-clang-tidy-18 -clang-tidy-binary clang-tidy-18 -p build/ci-linux -quiet libs/
 
   cpp-test-macos:
     name: C++ build+test (macOS arm64)
@@ -298,4 +298,6 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-smollm2-135m-q4-${{ runner.os }}
       - name: Greedy token parity (Rust self-check until the C++ tool exists)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: cpp/tests/parity/greedy_parity.sh --self-check --rust target/release/examples/greedy_ids --model smollm2-135m-q4 --max-new 32

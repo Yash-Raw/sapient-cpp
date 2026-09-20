@@ -12,12 +12,22 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   endif()
 endif()
 
-# Rust never contracts a*b+c into an FMA implicitly; Clang defaults to -ffp-contract=on.
-if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-  add_compile_options(/clang:-ffp-contract=off)
-else()
-  add_compile_options(-ffp-contract=off -fno-fast-math)
-endif()
+# Rust never contracts a*b+c into an FMA implicitly; Clang defaults to -ffp-contract=on. Scoped
+# to OUR code only (final review #7): this is a function, not applied here, so FetchContent deps
+# (e.g. googletest, populated at the top-level directory scope by cmake/deps.cmake) never see it
+# — only libs/apps/ffi CMakeLists.txt files that call sapient_apply_parity_flags_here() do, at
+# their own directory scope (inherited by their add_subdirectory() children).
+function(sapient_apply_parity_flags_here)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    # UCRT marks getenv deprecated; clang-cl reports it as -Wdeprecated-declarations, and our
+    # per-target /WX (sapient_apply_warnings) makes that fatal. The port reads SAPIENT_* knobs
+    # via getenv, so silence the deprecation instead of avoiding the standard C API.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_options(/clang:-ffp-contract=off)
+  else()
+    add_compile_options(-ffp-contract=off -fno-fast-math)
+  endif()
+endfunction()
 
 foreach(_bad IN ITEMS "-march=native" "-ffast-math" "-Ofast")
   if(CMAKE_CXX_FLAGS MATCHES "${_bad}" OR CMAKE_C_FLAGS MATCHES "${_bad}")

@@ -3,7 +3,7 @@
 # Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 """Fail if any source file under <root> lacks the two-line SAPIENT SPDX header.
 
-`//` header: .hpp .cpp .h .c .mm .m .wgsl .metal .rs .swift .kt .ts .tsx
+`//` header: .hpp .cpp .h .c .cc .cxx .hh .hxx .mm .m .wgsl .metal .rs .swift .kt .ts .tsx
 `#`  header: .cmake .py .sh .clang-format .clang-tidy CMakeLists.txt   (a shebang may precede it)
 Skipped: build/, third_party/, _deps/, fixtures/, node_modules/, .git/, *.json, *.md
 Usage: check_spdx.py <root> [<root> ...]
@@ -16,7 +16,10 @@ SLASH = (
     "// Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)",
 )
 HASH = tuple(line.replace("//", "#", 1) for line in SLASH)
-SLASH_EXT = {".hpp", ".cpp", ".h", ".c", ".mm", ".m", ".wgsl", ".metal", ".rs", ".swift", ".kt", ".ts", ".tsx"}
+SLASH_EXT = {
+    ".hpp", ".cpp", ".h", ".c", ".cc", ".cxx", ".hh", ".hxx",
+    ".mm", ".m", ".wgsl", ".metal", ".rs", ".swift", ".kt", ".ts", ".tsx",
+}
 HASH_EXT = {".cmake", ".py", ".sh"}
 HASH_NAMES = {"CMakeLists.txt", ".clang-format", ".clang-tidy"}
 SKIP_DIRS = {"build", "third_party", "_deps", "fixtures", "node_modules", ".git", "target"}

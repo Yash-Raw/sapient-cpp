@@ -57,10 +57,9 @@ if(SAPIENT_BUILD_TESTS)
   include(GoogleTest)
 endif()
 
-add_subdirectory(libs/sapient-core)
-if(SAPIENT_BUILD_TESTS)
-  add_subdirectory(libs/sapient-testing)
-endif()
+# apps/ and ffi/ (later sub-projects) must call sapient_apply_parity_flags_here() the same way
+# libs/CMakeLists.txt does, at their own directory scope.
+add_subdirectory(libs)
 
 if(SAPIENT_BUILD_TESTS)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)

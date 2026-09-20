@@ -10,6 +10,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "sapient/testing/golden.hpp"
 
 namespace fs = std::filesystem;
@@ -23,8 +29,19 @@ fs::path fixtures() {
     return fs::path(SAPIENT_TESTING_FIXTURES_DIR);
 }
 
+// Suffixed with the process id so concurrent test binaries (e.g. two ctest jobs, or a stray
+// re-run) never collide on the same filename in the shared temp directory.
+int current_pid() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+}
+
 fs::path temp_file(const char* stem) {
-    return fs::temp_directory_path() / (std::string("sapient_golden_") + stem + ".sapd");
+    return fs::temp_directory_path() /
+           (std::string("sapient_golden_") + stem + "_" + std::to_string(current_pid()) + ".sapd");
 }
 
 void write_bytes(const fs::path& p, const std::vector<uint8_t>& bytes) {

@@ -263,7 +263,8 @@ platform's in both languages → identical on the same OS. `select_nth_unstable`
 `std::nth_element` → only affects top-p on exact ties; document, don't chase.
 
 **Harness location:** `cpp/tests/parity/` — `greedy_parity.sh` (builds both, runs the model
-list, diffs), `golden/` dumps, `shader_sync.sh` (WGSL copies identical until Rust removal).
+list, diffs), `golden/` dumps; `cpp/scripts/shader_sync.py` (WGSL copies identical until Rust
+removal) and `cpp/scripts/check_spdx.py` (SPDX header gate).
 
 ### D2. Repository layout (side-by-side)
 
@@ -410,9 +411,9 @@ TypeScript SDK becomes a free regression suite at #3); 4 before audio because
 
 See D1 for the four-tier backbone and D5 for per-sub-project gates. In addition:
 
-- **CI (from sub-project 0):** `cpp-format` (clang-format --dry-run), `cpp-tidy`, `cpp-test-macos`
+- **CI (from sub-project 0):** `cpp-lint` (clang-format --dry-run + clang-tidy + the SPDX header
+  gate over `cpp/**` + the shader-sync diff of WGSL copies vs `crates/`), `cpp-test-macos`
   (macos-14, arm64), `cpp-test-linux` (ubuntu, `libasound2-dev`), `cpp-build-windows`,
-  `cpp-spdx` (header gate over `cpp/**`), `cpp-shader-sync` (diff WGSL copies vs `crates/`),
   `cpp-parity` **on both macos-14 (arm64, NEON path) and ubuntu (x86_64, scalar/AVX2 path)**:
   builds both languages in the same job, pulls `smollm2-135m-q4` with the Rust binary,
   regenerates the kernel golden dumps on that host, then greedy-diffs the C++ binary against
