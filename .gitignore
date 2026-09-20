@@ -12,3 +12,6 @@ dist/
 # Gradle state from the android-maven publishing scaffold
 scripts/android-maven/.gradle/
 scripts/android-maven/build/
+
+# Claude Code worktrees
+.claude/worktrees/
