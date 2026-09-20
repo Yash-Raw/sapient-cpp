@@ -14,12 +14,18 @@ namespace sapient::testing {
 namespace {
 
 constexpr uint32_t kFormatVersion = 1;
+// Sanity caps on file-provided counts, checked before they drive allocations (reserve/resize) —
+// a corrupted or adversarial .sapd must fail with a clean error, never std::bad_alloc/length_error.
+constexpr uint32_t kMaxArrays = 4096;
+constexpr uint32_t kMaxDims = 64;
 
 struct Cursor {
     const std::vector<uint8_t>& buf;
     size_t pos = 0;
 
-    bool has(size_t n) const { return pos + n <= buf.size(); }
+    // Subtraction form: `n` comes straight from the file (e.g. an 8-byte byte_len) and can be
+    // near SIZE_MAX, so `pos + n` would silently wrap and this would wrongly report `true`.
+    bool has(size_t n) const { return pos <= buf.size() && n <= buf.size() - pos; }
 
     template <class T>
     bool read(T& out) {
@@ -39,8 +45,10 @@ struct Cursor {
 
     bool read_bytes(std::vector<uint8_t>& out, uint64_t len) {
         if (!has(static_cast<size_t>(len))) return false;
-        out.assign(buf.begin() + static_cast<std::ptrdiff_t>(pos),
-                   buf.begin() + static_cast<std::ptrdiff_t>(pos + len));
+        // Never form `pos + len` first — `has()` already proved `len` fits, so build the end
+        // iterator from `first`, not from a second wrap-prone sum.
+        const auto first = buf.begin() + static_cast<std::ptrdiff_t>(pos);
+        out.assign(first, first + static_cast<std::ptrdiff_t>(len));
         pos += static_cast<size_t>(len);
         return true;
     }
@@ -48,6 +56,21 @@ struct Cursor {
 
 void set_error(std::string* error, std::string message) {
     if (error != nullptr) *error = std::move(message);
+}
+
+// Overflow-checked product of `dims`, matching GoldenArray::numel()'s convention (empty -> 1).
+// Used to validate file-provided dims BEFORE they're multiplied against dtype_size for the
+// byte-length check — a crafted dims array must not be able to wrap `numel()` into a small
+// value that spuriously satisfies `bytes.size() == numel()*dtype_size`.
+bool checked_numel(const std::vector<uint64_t>& dims, size_t& out) {
+    size_t n = 1;
+    for (const auto d : dims) {
+        const auto dv = static_cast<size_t>(d);
+        if (dv != 0 && n > SIZE_MAX / dv) return false;
+        n *= dv;
+    }
+    out = dims.empty() ? 1 : n;
+    return true;
 }
 
 }  // namespace
@@ -116,6 +139,10 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
         set_error(error, file.string() + ": truncated header");
         return std::nullopt;
     }
+    if (n_arrays > kMaxArrays) {
+        set_error(error, file.string() + ": implausible n_arrays " + std::to_string(n_arrays));
+        return std::nullopt;
+    }
     c.arrays.reserve(n_arrays);
     for (uint32_t i = 0; i < n_arrays; ++i) {
         GoldenArray a;
@@ -131,6 +158,10 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
             return std::nullopt;
         }
         a.dtype = static_cast<GoldenDType>(tag);
+        if (ndim > kMaxDims) {
+            set_error(error, file.string() + ": implausible ndim " + std::to_string(ndim) + " in " + a.name);
+            return std::nullopt;
+        }
         a.dims.resize(ndim);
         for (auto& d : a.dims) {
             if (!cur.read(d)) {
@@ -138,11 +169,16 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
                 return std::nullopt;
             }
         }
+        size_t expected_numel = 0;
+        if (!checked_numel(a.dims, expected_numel)) {
+            set_error(error, file.string() + ": dims overflow in " + a.name);
+            return std::nullopt;
+        }
         if (!cur.read(byte_len) || !cur.read_bytes(a.bytes, byte_len)) {
             set_error(error, file.string() + ": truncated payload in " + a.name);
             return std::nullopt;
         }
-        if (a.bytes.size() != a.numel() * dtype_size(a.dtype)) {
+        if (a.bytes.size() != expected_numel * dtype_size(a.dtype)) {
             set_error(error, file.string() + ": byte length does not match dims×dtype in " + a.name);
             return std::nullopt;
         }

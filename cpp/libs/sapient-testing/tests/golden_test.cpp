@@ -35,6 +35,20 @@ std::vector<uint8_t> read_bytes(const fs::path& p) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+// Tiny little-endian appenders for hand-building a .sapd byte buffer — no new dependencies.
+void put_u32(std::vector<uint8_t>& buf, uint32_t v) {
+    for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void put_u64(std::vector<uint8_t>& buf, uint64_t v) {
+    for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void put_str(std::vector<uint8_t>& buf, const std::string& s) {
+    put_u32(buf, static_cast<uint32_t>(s.size()));
+    buf.insert(buf.end(), s.begin(), s.end());
+}
+
 }  // namespace
 
 TEST(Golden, ReadsFormatSampleWrittenByRust) {
@@ -87,6 +101,49 @@ TEST(Golden, RejectsMissingFile) {
     std::string err;
     EXPECT_FALSE(read_golden(temp_file("nope-missing"), &err).has_value());
     EXPECT_FALSE(err.empty());
+}
+
+// A corrupted/adversarial .sapd must fail cleanly (nullopt + reason), never wrap into UB or an
+// uncaught exception, when its length/count fields are implausible.
+TEST(Golden, RejectsImplausibleLengthFields) {
+    // Variant 1: byte_len is near SIZE_MAX with no payload bytes following it. Cursor::has()
+    // must reject this via subtraction, not `pos + len` (which would wrap and read out of bounds).
+    {
+        std::vector<uint8_t> buf;
+        buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
+        put_u32(buf, 1);                      // version
+        put_str(buf, "x");                    // case name
+        put_u32(buf, 1);                      // n_arrays
+        put_str(buf, "in:a");                 // array name
+        buf.push_back(0);                     // dtype = F32
+        put_u32(buf, 1);                      // ndim
+        put_u64(buf, 1);                      // dims[0]
+        put_u64(buf, 0xFFFFFFFFFFFFFFF0ULL);  // byte_len — implausible, no payload follows
+        const auto p = temp_file("hugelen");
+        write_bytes(p, buf);
+        std::string err;
+        EXPECT_FALSE(read_golden(p, &err).has_value());
+        EXPECT_FALSE(err.empty()) << err;
+        fs::remove(p);
+    }
+    // Variant 2: ndim is near UINT32_MAX. Must be rejected before it drives an unbounded
+    // std::vector::resize (std::bad_alloc/std::length_error instead of a clean nullopt).
+    {
+        std::vector<uint8_t> buf;
+        buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
+        put_u32(buf, 1);              // version
+        put_str(buf, "x");            // case name
+        put_u32(buf, 1);              // n_arrays
+        put_str(buf, "in:a");         // array name
+        buf.push_back(0);             // dtype = F32
+        put_u32(buf, 0xFFFFFFFFu);    // ndim — implausible
+        const auto p = temp_file("hugendim");
+        write_bytes(p, buf);
+        std::string err;
+        EXPECT_FALSE(read_golden(p, &err).has_value());
+        EXPECT_FALSE(err.empty()) << err;
+        fs::remove(p);
+    }
 }
 
 // Real gate when SAPIENT_GOLDEN_DIR points at dumps made on this host by
