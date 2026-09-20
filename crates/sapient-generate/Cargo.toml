@@ -47,3 +47,8 @@ tokio    = { workspace = true }
 [[example]]
 name = "duplex_spike"
 path = "examples/duplex_spike.rs"
+
+# Rust→C++ parity oracle (test-only): greedy token ids under a fixed output contract.
+[[example]]
+name = "greedy_ids"
+path = "examples/greedy_ids.rs"
