@@ -1,0 +1,37 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    { "name": "base", "hidden": true, "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}" },
+    { "name": "dev", "inherits": "base",
+      "displayName": "Dev — tests at -O1 like cargo's [profile.test]",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",
+                          "CMAKE_CXX_FLAGS_DEBUG": "-O1 -g", "CMAKE_C_FLAGS_DEBUG": "-O1 -g" } },
+    { "name": "release", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "ci-macos", "inherits": "dev",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" } },
+    { "name": "ci-linux", "inherits": "dev",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++" } },
+    { "name": "ci-windows", "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",
+                          "CMAKE_C_COMPILER": "clang-cl", "CMAKE_CXX_COMPILER": "clang-cl",
+                          "CMAKE_CXX_FLAGS_DEBUG": "/clang:-O1 /Zi", "CMAKE_C_FLAGS_DEBUG": "/clang:-O1 /Zi" } }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "ci-macos", "configurePreset": "ci-macos" },
+    { "name": "ci-linux", "configurePreset": "ci-linux" },
+    { "name": "ci-windows", "configurePreset": "ci-windows" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "ci-macos", "configurePreset": "ci-macos", "output": { "outputOnFailure": true } },
+    { "name": "ci-linux", "configurePreset": "ci-linux", "output": { "outputOnFailure": true } },
+    { "name": "ci-windows", "configurePreset": "ci-windows", "output": { "outputOnFailure": true } }
+  ]
+}
