@@ -10,13 +10,14 @@
 set -euo pipefail
 
 RUST="" CPP="" MODEL="" PROMPT="Name three planets." MAX_NEW=64 SELF=0
+need_value() { [ "$#" -ge 2 ] || { echo "greedy_parity: missing value for '$1'" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --rust) RUST=$2; shift 2 ;;
-    --cpp) CPP=$2; shift 2 ;;
-    --model) MODEL=$2; shift 2 ;;
-    --prompt) PROMPT=$2; shift 2 ;;
-    --max-new) MAX_NEW=$2; shift 2 ;;
+    --rust) need_value "$@"; RUST=$2; shift 2 ;;
+    --cpp) need_value "$@"; CPP=$2; shift 2 ;;
+    --model) need_value "$@"; MODEL=$2; shift 2 ;;
+    --prompt) need_value "$@"; PROMPT=$2; shift 2 ;;
+    --max-new) need_value "$@"; MAX_NEW=$2; shift 2 ;;
     --self-check) SELF=1; shift ;;
     *) echo "greedy_parity: unknown argument '$1'" >&2; exit 2 ;;
   esac
