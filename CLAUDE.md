@@ -38,6 +38,16 @@ cp $(find target/release -name 'mlx.metallib' | head -1) target/release/
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
+```bash
+# C++ tree (parity port, see the "C++ rewrite programme" section)
+cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # Clang + Ninja required
+just cpp-lint                                   # SPDX headers (cpp/ AND crates/) + WGSL shader sync
+just cpp-golden /tmp/sapient-golden             # Rust oracle → kernel golden dumps for this host
+SAPIENT_GOLDEN_DIR=/tmp/sapient-golden just cpp-test
+cargo run --release -p sapient-generate --example greedy_ids -- smollm2-135m-q4 "Hi" 16   # greedy oracle
+cpp/tests/parity/greedy_parity.sh --self-check --rust target/release/examples/greedy_ids --model smollm2-135m-q4
+```
+
 **Pre-push hook:** `.githooks/pre-push` runs `cargo fmt --all` then `cargo clippy -D warnings` automatically. Enable once per clone with `git config core.hooksPath .githooks`. Bypass with `SKIP_LINT=1 git push`.
 
 ## Architecture overview
@@ -340,13 +350,14 @@ GGUFs without an embedded/HF chat template get a builtin guessed from arch + mod
 ## C++ rewrite programme (in progress since 2026-09-20)
 
 The workspace is being converted from Rust to C++ **as a parity port, not a redesign**. Design spec (approved): `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`. Rules that bind every C++ change:
-- **Side-by-side:** the C++ tree lives under `cpp/`; `crates/` stays building as the correctness oracle until every parity gate has passed (sub-project 9 removes it). Rust behaviour is frozen meanwhile — the only Rust addition allowed is the test-only kernel golden-dump example.
+- **Side-by-side:** the C++ tree lives under `cpp/`; `crates/` stays building as the correctness oracle until every parity gate has passed (sub-project 9 removes it). Rust behaviour is frozen meanwhile — the only Rust additions are two test-only examples: `crates/sapient-backends/cpu/examples/dump_kernels.rs` (kernel golden dumps, `.sapd` v1) and `crates/sapient-generate/examples/greedy_ids.rs` (greedy token-id oracle with a fixed five-line output contract). The Rust tree also received two behaviour-identical clippy-1.98 lint fixes, since clippy 1.98 (local and CI stable) newly fails on pre-existing code: `crates/sapient-scheduler/src/scheduler.rs` (`drain(..).collect()` → `std::mem::take`, 2 sites) and a targeted `#[allow(clippy::result_large_err)]` (with a comment) on `resolve_model` in `crates/sapient-cli/src/server.rs`.
 - **Toolchain:** C++20, CMake ≥3.24, **Clang everywhere (clang-cl on Windows)**, `-ffp-contract=off`, no `-march=native` / `-ffast-math` — bit-identity of the quant kernels vs the Rust build depends on these.
 - **Mirror, don't extend:** one CMake target per Rust crate (same name, namespace `sapient::<crate>`), one `.hpp/.cpp` per `.rs` module with the same stem, same test names, same `SAPIENT_*` env knobs, per-ISA SIMD dispatch table copied exactly (x86 K-quants stay scalar until parity is recorded).
 - **Third-party map:** SAPIENT-authored code is hand-converted; crates map to C++ libraries (nlohmann/json, CLI11, cpp-httplib, libcurl, minja for chat templates, an own `tokenizer.json` engine + PCRE2, wgpu-native so the WGSL shaders ship unchanged, the MLX C++ API, miniaudio, pocketfft, dr_libs, …). Full table in spec §D4.
 - **Gates:** kernel golden dumps (bit-identical, generated per host in CI), greedy token-identical decode vs the Rust binary, fixtures reused byte-for-byte; results recorded in `docs/PARITY.md`.
 - **Order:** 0 scaffold → 1a core/io/cpu kernels → 1b CPU `chat` vertical slice → 2 text engines → 3 hub/CLI/serve → 4 GPU → 5a/5b/5c audio → 6 vision → 7 FFI/mobile → 8 dead IR path → 9 docs/release/Rust removal.
 - SPDX header (same two lines) on every `.hpp/.cpp/.mm/.wgsl`; `#` form on CMake/sh/py — enforced by a CI gate over `cpp/`.
+- **Sub-project 0 landed (scaffold + oracle harness):** `cpp/` builds `sapient::core` (version) and the test-support `sapient::testing` (`.sapd` golden reader); gates = `Golden.*` GoogleTests, `lint.spdx_headers`, `lint.shader_sync`, `BuildFlags.FpContractIsOff` (fails if the compiler contracts `a*b+c` into an FMA); CI jobs `cpp-lint`, `cpp-test-{macos,linux}`, `cpp-build-windows`, `cpp-parity` (both hosts: Rust builds dumps → C++ consumes; greedy `--self-check` until 1b). Golden dumps are host-specific and never committed; the one committed fixture is the fixed-content `format_sample.sapd`. `cpp/.clang-format` sets `ReflowComments: false` (the SPDX line is 107 columns — reflowing would break the header gate). Ledger: `docs/PARITY.md`.
 
 ## Must follow
 

@@ -3,6 +3,14 @@
 Release notes for SAPIENT. The release workflow publishes each version's
 section below as the GitHub release body.
 
+## [Unreleased]
+
+### 🧱 C++ rewrite — sub-project 0 (scaffold + oracle harness)
+- `cpp/` CMake tree (C++20, Clang-only, `-ffp-contract=off`), GoogleTest, presets, CI jobs `cpp-*`.
+- Rust→C++ oracle harness: test-only `dump_kernels` (`.sapd` golden dumps) and `greedy_ids` examples, `sapient::testing` reader, `greedy_parity.sh`, SPDX and WGSL shader-sync gates, `docs/PARITY.md` ledger.
+- Rust tree: two behaviour-identical clippy-1.98 lint fixes (scheduler `mem::take`; targeted `result_large_err` allow in the CLI server) so the workspace clippy gate stays green on current stable.
+- No user-facing behaviour change; the Rust binaries are unaffected.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**

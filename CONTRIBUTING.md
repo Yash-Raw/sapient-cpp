@@ -576,7 +576,15 @@ The workspace is being ported to C++ (`cpp/`, C++20 + CMake, Clang) as a behavio
 
 - **Rust tree:** behaviour is frozen (bug fixes only, each mirrored in C++); do not change kernel numerics without updating the parity records.
 - **C++ tree:** follow the mirroring conventions (same crate/module/test names, same env knobs, `-ffp-contract=off`, no `-march=native`), keep the SPDX header on every file, and land each change with its parity-gate result in `docs/PARITY.md`.
-- The build/test/lint sections above describe the Rust tree; the C++ equivalents (`cmake --preset dev && ctest --preset dev`, clang-format, clang-tidy) are documented as sub-project 0 lands.
+- **C++ build/test/lint (sub-project 0 is in):** prerequisites are CMake ≥ 3.24, Ninja and **Clang** (Apple clang, clang ≥ 16, or clang-cl on Windows — GCC/MSVC are refused unless `-DSAPIENT_ALLOW_NON_CLANG=ON`, and such builds are not parity builds). Then:
+
+  ```bash
+  cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev
+  just cpp-fmt      # clang-format in place (CI runs --dry-run --Werror; the pre-push hook does too)
+  just cpp-lint     # SPDX header gate on cpp/ and crates/, WGSL shader-sync gate
+  ```
+
+  Kernel golden gates need dumps from the Rust oracle **made on your machine**: `just cpp-golden /tmp/sapient-golden` then `SAPIENT_GOLDEN_DIR=/tmp/sapient-golden just cpp-test`. Never commit dump files. Every new C++ source file carries the SPDX header (the `lint.spdx_headers` ctest fails otherwise), lives under `cpp/libs/sapient-<crate>/` mirroring the Rust module it ports, and every parity result goes in `docs/PARITY.md`. clang-tidy is not part of Apple's toolchain — install it with `brew install llvm` to run `run-clang-tidy` locally; otherwise the CI `cpp-lint` job runs it. When invoking `.githooks/pre-push` by hand, stage your edits first: the hook treats unstaged changes as formatter output and aborts.
 
 ## Getting help
 

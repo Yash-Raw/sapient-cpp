@@ -638,6 +638,10 @@ cargo build --release -p sapient-cli --features mlx
 
 Useful chat commands while chatting: `/help`, `/clear` (forget the conversation), `/exit`.
 
+### The C++ tree (in progress)
+
+The C++ port lives in `cpp/` and builds with CMake + Ninja + Clang: `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev`. Today it contains only the scaffolding and the "answer-key" machinery: a reader for the kernel test data the Rust build writes (`just cpp-golden`), header/shader lint gates, and CI jobs that build both languages on the same machine and compare them. Real inference code arrives with sub-projects 1a/1b (see `docs/ROADMAP.md` Phase 7 and `docs/PARITY.md`).
+
 ---
 
 ## 7. How the pieces depend on each other (the map)

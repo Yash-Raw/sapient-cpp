@@ -723,6 +723,12 @@ cargo build -p sapient-cli --release --features mlx
 ./target/release/sapient
 ```
 
+**C++ tree (parity port, in progress):**
+
+```bash
+cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # CMake ≥ 3.24, Ninja, Clang
+```
+
 ---
 
 ## License
