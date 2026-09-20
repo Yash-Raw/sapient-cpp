@@ -215,9 +215,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y ninja-build clang-18 clang-tidy-18 clang-format-18
+      - run: sudo apt-get update -q && sudo apt-get install -y ninja-build clang-18 clang-tidy-18 clang-tools-18 clang-format-18
       - name: clang-format (dry run)
-        run: git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' | xargs clang-format-18 --dry-run --Werror
+        run: git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs clang-format-18 --dry-run --Werror
       - name: SPDX headers (cpp/ and crates/)
         run: python3 cpp/scripts/check_spdx.py cpp crates
       - name: Shader copies match Rust originals
