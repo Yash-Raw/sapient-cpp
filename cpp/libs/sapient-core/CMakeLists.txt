@@ -9,7 +9,9 @@ sapient_apply_warnings(sapient_core)
 if(SAPIENT_BUILD_TESTS)
   add_executable(sapient_core_tests tests/version_test.cpp tests/build_flags_test.cpp)
   target_link_libraries(sapient_core_tests PRIVATE sapient::core GTest::gtest_main)
-  target_compile_definitions(sapient_core_tests PRIVATE SAPIENT_VERSION_STRING="${PROJECT_VERSION}")
+  target_compile_definitions(sapient_core_tests PRIVATE
+    SAPIENT_VERSION_STRING="${PROJECT_VERSION}"
+    SAPIENT_CARGO_TOML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../Cargo.toml")
   sapient_apply_warnings(sapient_core_tests)
   gtest_discover_tests(sapient_core_tests)
 endif()

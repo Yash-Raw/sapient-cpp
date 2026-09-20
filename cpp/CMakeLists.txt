@@ -3,15 +3,34 @@
 cmake_minimum_required(VERSION 3.24)
 
 # Version: single source of truth is the Rust workspace manifest while crates/ exists.
+# No hardcoded fallback here on purpose: a broken extraction (or a missing Cargo.toml once
+# the Rust tree is removed) must fail configure loudly, not silently pin a stale version.
 set(_cargo_toml "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml")
 if(EXISTS "${_cargo_toml}")
   file(READ "${_cargo_toml}" _cargo)
   # `version` is the first key after the [workspace.package] header in ../Cargo.toml.
   string(REGEX MATCH "\\[workspace\\.package\\][ \t\r\n]*version[ \t]*=[ \t]*\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" _m "${_cargo}")
-  set(SAPIENT_VERSION "${CMAKE_MATCH_1}")
-endif()
-if(NOT SAPIENT_VERSION)
-  set(SAPIENT_VERSION "0.6.0")
+  if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR
+      "SAPIENT: could not extract [workspace.package] version from ../Cargo.toml — "
+      "fix the regex in cpp/CMakeLists.txt or pass -DSAPIENT_VERSION=X.Y.Z")
+  endif()
+  set(_extracted_version "${CMAKE_MATCH_1}")
+  if(DEFINED SAPIENT_VERSION AND NOT "${SAPIENT_VERSION}" STREQUAL "")
+    if(NOT "${SAPIENT_VERSION}" STREQUAL "${_extracted_version}")
+      message(FATAL_ERROR
+        "SAPIENT: -DSAPIENT_VERSION=${SAPIENT_VERSION} does not match the version extracted "
+        "from ../Cargo.toml (${_extracted_version})")
+    endif()
+  else()
+    set(SAPIENT_VERSION "${_extracted_version}")
+  endif()
+else()
+  if(NOT DEFINED SAPIENT_VERSION OR "${SAPIENT_VERSION}" STREQUAL "")
+    message(FATAL_ERROR
+      "SAPIENT: ../Cargo.toml not found (the Rust tree has been removed) and no "
+      "-DSAPIENT_VERSION=X.Y.Z was given — pass the version explicitly")
+  endif()
 endif()
 
 project(sapient VERSION ${SAPIENT_VERSION} LANGUAGES C CXX)
