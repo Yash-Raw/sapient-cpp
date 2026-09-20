@@ -22,8 +22,9 @@ HASH_NAMES = {"CMakeLists.txt", ".clang-format", ".clang-tidy"}
 SKIP_DIRS = {"build", "third_party", "_deps", "fixtures", "node_modules", ".git", "target"}
 
 
-def expected_header(path: pathlib.Path):
-    if any(part in SKIP_DIRS for part in path.parts):
+def expected_header(path: pathlib.Path, base: pathlib.Path):
+    rel_parts = path.relative_to(base).parts
+    if any(part in SKIP_DIRS for part in rel_parts):
         return None
     if path.name in HASH_NAMES or path.suffix in HASH_EXT:
         return HASH
@@ -33,26 +34,43 @@ def expected_header(path: pathlib.Path):
 
 
 def check_root(root: str):
+    base = pathlib.Path(root)
+    if not base.is_dir():
+        print(f"check_spdx: root does not exist: {root}", file=sys.stderr)
+        sys.exit(2)
+    scanned = 0
     bad = []
-    for path in sorted(pathlib.Path(root).rglob("*")):
+    for path in sorted(base.rglob("*")):
         if not path.is_file():
             continue
-        expected = expected_header(path)
+        expected = expected_header(path, base)
         if expected is None:
             continue
+        scanned += 1
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         if lines and lines[0].startswith("#!"):
             lines = lines[1:]
         if tuple(lines[:2]) != expected:
             bad.append(path)
-    return bad
+    if scanned == 0:
+        print(f"check_spdx: no source files found under {root} (nothing was checked)", file=sys.stderr)
+        sys.exit(2)
+    return scanned, bad
 
 
 def main(roots):
-    bad = [p for root in roots for p in check_root(root)]
+    scanned_total = 0
+    bad = []
+    for root in roots:
+        scanned, root_bad = check_root(root)
+        scanned_total += scanned
+        bad.extend(root_bad)
     for p in bad:
         print(f"check_spdx: missing/incorrect SPDX header: {p}", file=sys.stderr)
-    print(f"check_spdx: {'FAIL' if bad else 'OK'} ({len(bad)} file(s) without the header; roots: {', '.join(roots)})")
+    print(
+        f"check_spdx: {'FAIL' if bad else 'OK'} "
+        f"({scanned_total} file(s) checked, {len(bad)} without the header; roots: {', '.join(roots)})"
+    )
     return 1 if bad else 0
 
 

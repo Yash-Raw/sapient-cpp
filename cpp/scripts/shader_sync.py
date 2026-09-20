@@ -18,6 +18,9 @@ CPP = "cpp/libs/sapient-backends-wgpu/shaders"
 def main(repo: str) -> int:
     root = pathlib.Path(repo)
     rust, cpp = root / RUST, root / CPP
+    if not cpp.is_dir():
+        print(f"shader_sync: not a repository root (no {CPP}): {repo}", file=sys.stderr)
+        return 2
     if not rust.is_dir():
         print("shader_sync: Rust shader directory absent (post-removal) — nothing to compare")
         return 0
