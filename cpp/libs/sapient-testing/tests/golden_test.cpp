@@ -144,6 +144,29 @@ TEST(Golden, RejectsImplausibleLengthFields) {
         EXPECT_FALSE(err.empty()) << err;
         fs::remove(p);
     }
+    // Variant 3: a single huge dim (2^62+1) passes checked_numel() (it fits in one size_t) but
+    // must not be allowed to wrap once multiplied by dtype_size against a small, matching-looking
+    // byte_len/payload — the numel×element-size guard must catch this before the byte-length
+    // comparison would spuriously accept it.
+    {
+        std::vector<uint8_t> buf;
+        buf.insert(buf.end(), {'S', 'A', 'P', 'D'});
+        put_u32(buf, 1);                        // version
+        put_str(buf, "x");                      // case name
+        put_u32(buf, 1);                        // n_arrays
+        put_str(buf, "in:a");                   // array name
+        buf.push_back(0);                       // dtype = F32
+        put_u32(buf, 1);                        // ndim
+        put_u64(buf, 0x4000000000000001ULL);    // dims[0] = 2^62 + 1
+        put_u64(buf, 4);                        // byte_len — small, matches a 4-byte payload
+        buf.insert(buf.end(), {0, 0, 0, 0});    // 4 payload bytes
+        const auto p = temp_file("hugenumelbytesize");
+        write_bytes(p, buf);
+        std::string err;
+        EXPECT_FALSE(read_golden(p, &err).has_value());
+        EXPECT_FALSE(err.empty()) << err;
+        fs::remove(p);
+    }
 }
 
 // Real gate when SAPIENT_GOLDEN_DIR points at dumps made on this host by

@@ -174,11 +174,20 @@ std::optional<GoldenCase> read_golden(const std::filesystem::path& file, std::st
             set_error(error, file.string() + ": dims overflow in " + a.name);
             return std::nullopt;
         }
+        // Guard the numel × element-size multiplication the same way checked_numel() guards the
+        // dims product — a single huge dim can pass checked_numel (fits in one size_t) yet still
+        // wrap here once multiplied by dtype_size, which could spuriously match a small
+        // bytes.size() and accept a corrupted array as valid.
+        const size_t es = dtype_size(a.dtype);
+        if (expected_numel > SIZE_MAX / es) {
+            set_error(error, file.string() + ": dims × element size overflow in " + a.name);
+            return std::nullopt;
+        }
         if (!cur.read(byte_len) || !cur.read_bytes(a.bytes, byte_len)) {
             set_error(error, file.string() + ": truncated payload in " + a.name);
             return std::nullopt;
         }
-        if (a.bytes.size() != expected_numel * dtype_size(a.dtype)) {
+        if (a.bytes.size() != expected_numel * es) {
             set_error(error, file.string() + ": byte length does not match dims×dtype in " + a.name);
             return std::nullopt;
         }
