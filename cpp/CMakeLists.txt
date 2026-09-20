@@ -58,3 +58,6 @@ if(SAPIENT_BUILD_TESTS)
 endif()
 
 add_subdirectory(libs/sapient-core)
+if(SAPIENT_BUILD_TESTS)
+  add_subdirectory(libs/sapient-testing)
+endif()
