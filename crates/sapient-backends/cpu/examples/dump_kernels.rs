@@ -1,0 +1,495 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
+//! Golden-dump generator for the Rust→C++ parity harness (TEST-ONLY; not part of the product).
+//!
+//! Writes one `.sapd` file per kernel case: seeded-random inputs plus the outputs the Rust
+//! kernels produce ON THIS HOST. The public kernel entry points dispatch on the host ISA at
+//! runtime (NEON/SDOT/SMMLA vs scalar/AVX2), so dumps are host-specific: regenerate them in the
+//! same job that consumes them and never commit them (spec D1).
+//!
+//! Wire format v1 (little-endian):
+//!   "SAPD" | u32 version=1 | u32 name_len | name | u32 n_arrays |
+//!   per array: u32 name_len | name | u8 dtype | u32 ndim | u64 dims[ndim] | u64 byte_len | bytes
+//!   dtype: 0=f32 1=u8 2=i8 3=i32 4=u32 5=u64.  Names are prefixed `in:` / `param:` / `out:`.
+//!
+//! Usage:
+//!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --out <dir> [--seed N]
+//!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --format-sample <file>
+
+use std::error::Error;
+use std::fs;
+use std::path::PathBuf;
+
+use half::f16;
+use sapient_backends_cpu::kernels::{
+    attention, elementwise, layernorm, matmul, quant, rope, softmax,
+};
+use sapient_core::{DType, Tensor};
+
+const FORMAT_VERSION: u32 = 1;
+const DT_F32: u8 = 0;
+const DT_U8: u8 = 1;
+const DT_I8: u8 = 2;
+const DT_I32: u8 = 3;
+const DT_U32: u8 = 4;
+const DT_U64: u8 = 5;
+const DEFAULT_SEED: u64 = 0x5A71_E47D_0000_0001;
+
+const USAGE: &str = "usage: dump_kernels --out <dir> [--seed N] | --format-sample <file>";
+
+/// xorshift64* — deterministic, dependency-free (same family as the sampler's RNG).
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.unit()
+    }
+    fn f32s(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n).map(|_| self.range(lo, hi)).collect()
+    }
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| (self.next_u64() >> 56) as u8).collect()
+    }
+}
+
+struct Array {
+    name: String,
+    dtype: u8,
+    dims: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+fn dtype_size(dtype: u8) -> usize {
+    match dtype {
+        DT_F32 | DT_I32 | DT_U32 => 4,
+        DT_U8 | DT_I8 => 1,
+        DT_U64 => 8,
+        other => panic!("unknown dtype tag {other}"),
+    }
+}
+
+impl Array {
+    fn raw(name: &str, dtype: u8, dims: &[usize], bytes: Vec<u8>) -> Self {
+        let numel: usize = dims.iter().product();
+        assert_eq!(
+            bytes.len(),
+            numel * dtype_size(dtype),
+            "{name}: byte length mismatch"
+        );
+        Array {
+            name: name.to_string(),
+            dtype,
+            dims: dims.iter().map(|&d| d as u64).collect(),
+            bytes,
+        }
+    }
+    fn f32(name: &str, dims: &[usize], v: &[f32]) -> Self {
+        Self::raw(
+            name,
+            DT_F32,
+            dims,
+            v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        )
+    }
+    fn u8(name: &str, dims: &[usize], v: &[u8]) -> Self {
+        Self::raw(name, DT_U8, dims, v.to_vec())
+    }
+    fn i8(name: &str, dims: &[usize], v: &[i8]) -> Self {
+        Self::raw(name, DT_I8, dims, v.iter().map(|&x| x as u8).collect())
+    }
+    fn i32(name: &str, dims: &[usize], v: &[i32]) -> Self {
+        Self::raw(
+            name,
+            DT_I32,
+            dims,
+            v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        )
+    }
+    fn u32(name: &str, dims: &[usize], v: &[u32]) -> Self {
+        Self::raw(
+            name,
+            DT_U32,
+            dims,
+            v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        )
+    }
+    fn u64(name: &str, dims: &[usize], v: &[u64]) -> Self {
+        Self::raw(
+            name,
+            DT_U64,
+            dims,
+            v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        )
+    }
+    /// An F32 tensor (any layout) as `f32` with its shape.
+    fn tensor(name: &str, t: &Tensor) -> Self {
+        Self::f32(name, t.shape().dims(), &t.to_f32_vec())
+    }
+}
+
+fn put_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn encode_case(name: &str, arrays: &[Array]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SAPD");
+    buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    put_str(&mut buf, name);
+    buf.extend_from_slice(&(arrays.len() as u32).to_le_bytes());
+    for a in arrays {
+        put_str(&mut buf, &a.name);
+        buf.push(a.dtype);
+        buf.extend_from_slice(&(a.dims.len() as u32).to_le_bytes());
+        for d in &a.dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&(a.bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&a.bytes);
+    }
+    buf
+}
+
+// ── quantized block builders ─────────────────────────────────────────────────────────────────
+// K-quant blocks are random bits with FINITE f16 scales (random f16 bits could be NaN/Inf).
+
+fn f16_bytes(v: f32) -> [u8; 2] {
+    f16::from_f32(v).to_le_bytes()
+}
+
+fn q4_k_block(rng: &mut Rng) -> Vec<u8> {
+    let mut b = Vec::with_capacity(144);
+    b.extend_from_slice(&f16_bytes(rng.range(0.002, 0.05))); // d
+    b.extend_from_slice(&f16_bytes(rng.range(0.0, 0.02))); // dmin
+    b.extend(rng.bytes(12)); // packed 6-bit scales/mins
+    b.extend(rng.bytes(128)); // nibbles
+    b
+}
+
+fn q5_k_block(rng: &mut Rng) -> Vec<u8> {
+    let mut b = Vec::with_capacity(176);
+    b.extend_from_slice(&f16_bytes(rng.range(0.002, 0.05)));
+    b.extend_from_slice(&f16_bytes(rng.range(0.0, 0.02)));
+    b.extend(rng.bytes(12)); // scales
+    b.extend(rng.bytes(32)); // qh (5th bits)
+    b.extend(rng.bytes(128)); // qs
+    b
+}
+
+fn q6_k_block(rng: &mut Rng) -> Vec<u8> {
+    let mut b = Vec::with_capacity(210);
+    b.extend(rng.bytes(128)); // ql
+    b.extend(rng.bytes(64)); // qh
+    b.extend(rng.bytes(16)); // 16 signed int8 scales (any bits are valid)
+    b.extend_from_slice(&f16_bytes(rng.range(0.002, 0.05))); // d
+    b
+}
+
+fn q8_0_row(w: &[f32]) -> Vec<u8> {
+    w.chunks(32).flat_map(quant::quantize_q8_0_block).collect()
+}
+
+fn q4_0_row(w: &[f32]) -> Vec<u8> {
+    w.chunks(32).flat_map(quant::quantize_q4_0_block).collect()
+}
+
+type BlockFn = fn(&mut Rng) -> Vec<u8>;
+type DotFn = fn(&[u8], &[f32]) -> f32;
+
+fn kquant_rows(rng: &mut Rng, rows: usize, k: usize, block: BlockFn) -> Vec<u8> {
+    (0..rows * k / 256).flat_map(|_| block(rng)).collect()
+}
+
+type Case = (String, Vec<Array>);
+
+fn case(name: impl Into<String>, arrays: Vec<Array>) -> Case {
+    (name.into(), arrays)
+}
+
+// ── the cases ────────────────────────────────────────────────────────────────────────────────
+
+fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
+    let mut rng = Rng::new(seed);
+    let mut cases: Vec<Case> = Vec::new();
+
+    // Block quantizers.
+    let x32 = rng.f32s(32, -1.0, 1.0);
+    let q8 = quant::quantize_q8_0_block(&x32);
+    cases.push(case(
+        "quantize_q8_0_block",
+        vec![
+            Array::f32("in:x", &[32], &x32),
+            Array::u8("out:block", &[34], &q8),
+        ],
+    ));
+    let q4 = quant::quantize_q4_0_block(&x32);
+    cases.push(case(
+        "quantize_q4_0_block",
+        vec![
+            Array::f32("in:x", &[32], &x32),
+            Array::u8("out:block", &[18], &q4),
+        ],
+    ));
+
+    // Row dot products (k = 256 for the 32-wide formats, 512 = two super-blocks for K-quants).
+    let w = rng.f32s(256, -1.0, 1.0);
+    let x = rng.f32s(256, -1.0, 1.0);
+    let row = q8_0_row(&w);
+    let y = quant::dot_q8_0_row_f32(&row, &x);
+    cases.push(case(
+        "dot_q8_0_row_f32",
+        vec![
+            Array::u8("in:row_blocks", &[row.len()], &row),
+            Array::f32("in:x", &[256], &x),
+            Array::f32("out:y", &[1], &[y]),
+        ],
+    ));
+    let row = q4_0_row(&w);
+    let y = quant::dot_q4_0_row_f32(&row, &x);
+    cases.push(case(
+        "dot_q4_0_row_f32",
+        vec![
+            Array::u8("in:row_blocks", &[row.len()], &row),
+            Array::f32("in:x", &[256], &x),
+            Array::f32("out:y", &[1], &[y]),
+        ],
+    ));
+    let xk = rng.f32s(512, -1.0, 1.0);
+    let kq: [(&str, BlockFn, DotFn); 3] = [
+        ("dot_q4_k_row_f32", q4_k_block, quant::dot_q4_k_row_f32),
+        ("dot_q5_k_row_f32", q5_k_block, quant::dot_q5_k_row_f32),
+        ("dot_q6_k_row_f32", q6_k_block, quant::dot_q6_k_row_f32),
+    ];
+    for (name, block, dot) in kq {
+        let row = kquant_rows(&mut rng, 1, 512, block);
+        let y = dot(&row, &xk);
+        cases.push(case(
+            name,
+            vec![
+                Array::u8("in:row_blocks", &[row.len()], &row),
+                Array::f32("in:x", &[512], &xk),
+                Array::f32("out:y", &[1], &[y]),
+            ],
+        ));
+    }
+
+    // matmul_nt: f32 weights (GEMV m=1 and GEMM m=4).
+    let (k, n) = (64usize, 16usize);
+    let wt = Tensor::from_f32(&rng.f32s(n * k, -1.0, 1.0), vec![n, k])?;
+    for m in [1usize, 4] {
+        let xt = Tensor::from_f32(&rng.f32s(m * k, -1.0, 1.0), vec![m, k])?;
+        let y = matmul::matmul_nt(&xt, &wt)?;
+        cases.push(case(
+            format!("matmul_nt_f32_m{m}"),
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("in:w", &wt),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    // matmul_nt: quantized weights [8, 512] (decode m=1 and prefill m=3 paths).
+    let (rows, kq_len) = (8usize, 512usize);
+    let wq8 = q8_0_row(&rng.f32s(rows * kq_len, -1.0, 1.0));
+    let quants: [(&str, DType, Vec<u8>); 3] = [
+        ("q8_0", DType::Q8_0, wq8),
+        (
+            "q4_k",
+            DType::Q4_K,
+            kquant_rows(&mut rng, rows, kq_len, q4_k_block),
+        ),
+        (
+            "q6_k",
+            DType::Q6_K,
+            kquant_rows(&mut rng, rows, kq_len, q6_k_block),
+        ),
+    ];
+    for (tag, dtype, wbytes) in quants {
+        let wt = Tensor::from_quant_bytes(&wbytes, vec![rows, kq_len], dtype)?;
+        for m in [1usize, 3] {
+            let xt = Tensor::from_f32(&rng.f32s(m * kq_len, -1.0, 1.0), vec![m, kq_len])?;
+            let y = matmul::matmul_nt(&xt, &wt)?;
+            cases.push(case(
+                format!("matmul_nt_{tag}_m{m}"),
+                vec![
+                    Array::tensor("in:x", &xt),
+                    Array::u8("in:w_blocks", &[wbytes.len()], &wbytes),
+                    Array::u32("param:w_shape", &[2], &[rows as u32, kq_len as u32]),
+                    Array::tensor("out:y", &y),
+                ],
+            ));
+        }
+    }
+
+    // Norm / activation / softmax.
+    let xt = Tensor::from_f32(&rng.f32s(2 * 64, -2.0, 2.0), vec![2, 64])?;
+    let wt = Tensor::from_f32(&rng.f32s(64, 0.5, 1.5), vec![64])?;
+    let y = layernorm::rms_norm(&xt, Some(&wt), 1e-5)?;
+    cases.push(case(
+        "rms_norm",
+        vec![
+            Array::tensor("in:x", &xt),
+            Array::tensor("in:weight", &wt),
+            Array::f32("param:eps", &[1], &[1e-5]),
+            Array::tensor("out:y", &y),
+        ],
+    ));
+    let xt = Tensor::from_f32(&rng.f32s(2 * 3 * 8, -4.0, 4.0), vec![2, 3, 8])?;
+    let y = softmax::softmax(&xt, -1)?;
+    cases.push(case(
+        "softmax",
+        vec![
+            Array::tensor("in:x", &xt),
+            Array::i32("param:axis", &[1], &[-1]),
+            Array::tensor("out:y", &y),
+        ],
+    ));
+    let xt = Tensor::from_f32(&rng.f32s(64, -6.0, 6.0), vec![64])?;
+    cases.push(case(
+        "silu",
+        vec![
+            Array::tensor("in:x", &xt),
+            Array::tensor("out:y", &elementwise::silu(&xt)?),
+        ],
+    ));
+    cases.push(case(
+        "gelu_erf",
+        vec![
+            Array::tensor("in:x", &xt),
+            Array::tensor("out:y", &elementwise::gelu_erf(&xt)?),
+        ],
+    ));
+
+    // RoPE on [batch=1, heads=2, seq=4, head_dim=16] at cache offset 5.
+    let xt = Tensor::from_f32(&rng.f32s(2 * 4 * 16, -1.0, 1.0), vec![1, 2, 4, 16])?;
+    let positions: Vec<usize> = vec![5, 6, 7, 8];
+    let y = rope::apply_rope(&xt, &positions, 10_000.0)?;
+    cases.push(case(
+        "apply_rope",
+        vec![
+            Array::tensor("in:x", &xt),
+            Array::u64(
+                "param:positions",
+                &[4],
+                &positions.iter().map(|&p| p as u64).collect::<Vec<_>>(),
+            ),
+            Array::f32("param:base", &[1], &[10_000.0]),
+            Array::tensor("out:y", &y),
+        ],
+    ));
+
+    // GQA attention (4 heads over 2 kv heads), built-in causal mask (mask = None).
+    let hd = 16usize;
+    let attn = |rng: &mut Rng, seq_q: usize, seq_k: usize| -> Result<Vec<Array>, Box<dyn Error>> {
+        let q = Tensor::from_f32(&rng.f32s(4 * seq_q * hd, -1.0, 1.0), vec![1, 4, seq_q, hd])?;
+        let k = Tensor::from_f32(&rng.f32s(2 * seq_k * hd, -1.0, 1.0), vec![1, 2, seq_k, hd])?;
+        let v = Tensor::from_f32(&rng.f32s(2 * seq_k * hd, -1.0, 1.0), vec![1, 2, seq_k, hd])?;
+        let y = attention::scaled_dot_product_attention(&q, &k, &v, None, None, 2)?;
+        Ok(vec![
+            Array::tensor("in:q", &q),
+            Array::tensor("in:k", &k),
+            Array::tensor("in:v", &v),
+            Array::u32("param:n_kv_heads", &[1], &[2]),
+            Array::tensor("out:y", &y),
+        ])
+    };
+    cases.push(case("attention_prefill", attn(&mut rng, 4, 4)?));
+    cases.push(case("attention_decode", attn(&mut rng, 1, 5)?));
+
+    Ok(cases)
+}
+
+/// Fixed-content sample for the C++ reader's unit test (committed as a fixture; contains no
+/// kernel output, so it is host-independent).
+fn format_sample() -> Case {
+    case(
+        "format_sample",
+        vec![
+            Array::f32("in:f32", &[5], &[0.0, 1.0, -1.0, 0.5, 3.25]),
+            Array::u8("in:u8", &[2, 2], &[0, 1, 2, 255]),
+            Array::i8("in:i8", &[2], &[-128, 127]),
+            Array::i32("param:i32", &[1], &[-42]),
+            Array::u32("param:u32", &[1], &[4_000_000_000]),
+            Array::u64("param:u64", &[1], &[1 << 40]),
+            Array::f32("out:empty", &[0], &[]),
+        ],
+    )
+}
+
+fn take(args: &[String], i: usize, flag: &str) -> String {
+    args.get(i + 1).cloned().unwrap_or_else(|| {
+        eprintln!("{flag} needs a value\n{USAGE}");
+        std::process::exit(2)
+    })
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut out: Option<PathBuf> = None;
+    let mut sample: Option<PathBuf> = None;
+    let mut seed = DEFAULT_SEED;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                out = Some(PathBuf::from(take(&args, i, "--out")));
+                i += 2;
+            }
+            "--format-sample" => {
+                sample = Some(PathBuf::from(take(&args, i, "--format-sample")));
+                i += 2;
+            }
+            "--seed" => {
+                seed = take(&args, i, "--seed").parse()?;
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if sample.is_none() && out.is_none() {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    }
+    if let Some(path) = sample {
+        let (name, arrays) = format_sample();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, encode_case(&name, &arrays))?;
+        println!("wrote format sample to {}", path.display());
+    }
+    if let Some(dir) = out {
+        fs::create_dir_all(&dir)?;
+        let cases = build_cases(seed)?;
+        for (name, arrays) in &cases {
+            let path = dir.join(format!("{name}.sapd"));
+            fs::write(&path, encode_case(name, arrays))?;
+            println!("{}", path.display());
+        }
+        println!(
+            "wrote {} cases to {} (seed {seed:#x})",
+            cases.len(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
