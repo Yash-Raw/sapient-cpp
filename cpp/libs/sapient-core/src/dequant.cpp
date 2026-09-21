@@ -133,9 +133,19 @@ void blocks(std::span<const uint8_t> bytes, size_t numel, float* out) {
 }
 template <size_t BlockBytes, void (*Fn)(const uint8_t*, float*)>
 void r4(std::span<const uint8_t> bytes, size_t rows, size_t k, float* out) {
+    // Mirrors the three preconditions `repack_q4_k_rows4`/`repack_q6_k_rows4`
+    // assert (crates/sapient-backends/cpu/src/kernels/quant.rs:1230-1234,
+    // :2001-2005): without them a bad (rows, k, bytes) triple either
+    // out-of-bounds-writes `out` (an aggregate size check alone would not
+    // catch a wrong rows/k split of the same total) or divides by zero below
+    // (`nb == 0` when `k < 256`). Checked in the same order as the Rust
+    // asserts, before `nb` is used for anything.
+    if (rows % 4 != 0) panic("dequant r4: rows must be a multiple of 4");
+    if (k % 256 != 0) panic("dequant r4: k must be a multiple of 256");
     const size_t nb = k / 256;
+    const size_t row_bytes = nb * BlockBytes;
+    if (bytes.size() != rows * row_bytes) panic("dequant r4: byte length does not match rows * k");
     const size_t nblocks = bytes.size() / BlockBytes;
-    if (nblocks * 256 > rows * k) panic("dequant r4: block count exceeds output capacity");
     for (size_t p = 0; p < nblocks; ++p) {
         const size_t g = p / (4 * nb), rem = p % (4 * nb), b = rem / 4, r = rem % 4;
         const size_t row = g * 4 + r;
