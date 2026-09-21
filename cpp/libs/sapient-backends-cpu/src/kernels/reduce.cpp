@@ -12,7 +12,6 @@
 
 namespace sapient::backends_cpu::kernels::reduce {
 
-using sapient::core::Error;
 using sapient::core::Shape;
 
 namespace {

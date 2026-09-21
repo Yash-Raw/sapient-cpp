@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/reduce.hpp"

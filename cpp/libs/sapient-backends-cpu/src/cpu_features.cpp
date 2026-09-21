@@ -24,7 +24,9 @@
 #endif
 #endif
 #elif defined(__x86_64__) || defined(_M_X64)
-#if defined(_MSC_VER)
+// MSVC proper only; clang-cl takes the GNU arm below (verified: clang ships <cpuid.h> and accepts
+// GNU inline asm).
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #else
 #include <cpuid.h>
@@ -79,7 +81,7 @@ struct CpuidRegs {
 };
 CpuidRegs cpuid(uint32_t leaf, uint32_t sub) {
     CpuidRegs r;
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
     int out[4] = {0, 0, 0, 0};
     __cpuidex(out, static_cast<int>(leaf), static_cast<int>(sub));
     r.eax = static_cast<uint32_t>(out[0]);
@@ -92,7 +94,7 @@ CpuidRegs cpuid(uint32_t leaf, uint32_t sub) {
     return r;
 }
 uint64_t xgetbv0() {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
     return _xgetbv(0);
 #else
     uint32_t eax = 0;

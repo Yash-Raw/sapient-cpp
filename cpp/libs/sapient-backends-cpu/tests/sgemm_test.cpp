@@ -216,7 +216,7 @@ TEST(Sgemm, row_and_column_blocks_are_bit_identical_to_the_full_call) {
               1);
     }
     std::vector<float> cols(m * n, 0.0f);
-    const size_t split = 20;
+    const size_t split = 21; // not a multiple of 4: the second call's columns start mid-strip
     sgemm(m,
           k,
           split,
@@ -291,7 +291,7 @@ TEST(Sgemm, beta_zero_never_reads_c) {
 }
 
 TEST(Sgemm, alpha_and_beta_scale) {
-    const size_t m = 5, k = 33, n = 6;
+    const size_t m = 5, k = 300, n = 6; // k > KC = 256: alpha is applied per panel
     const auto a = rand_vec(m * k, 41);
     const auto b = rand_vec(k * n, 42);
     const auto c0 = rand_vec(m * n, 43);

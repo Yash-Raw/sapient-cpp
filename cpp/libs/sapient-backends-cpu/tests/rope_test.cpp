@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/rope.hpp"
