@@ -949,6 +949,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    if q8k_off
+        && std::env::var("SAPIENT_Q8K_ACT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
+        eprintln!("--q8k-off must run with SAPIENT_Q8K_ACT=0 (the knob is read once per process)");
+        std::process::exit(2);
+    }
     if sample.is_none() && out.is_none() {
         eprintln!("{USAGE}");
         std::process::exit(2);

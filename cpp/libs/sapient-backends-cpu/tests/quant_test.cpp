@@ -316,9 +316,12 @@ std::vector<float> ramp(size_t k, size_t mul, size_t mod, float sub, float step)
         x[i] = (static_cast<float>(i * mul % mod) - sub) * step;
     return x;
 }
+#if defined(__aarch64__) || defined(_M_ARM64)
+// Only the aarch64-only tests slice rows out of a fixture.
 std::span<const uint8_t> row_of(const std::vector<uint8_t>& rows, size_t r, size_t row_bytes) {
     return std::span<const uint8_t>(rows).subspan(r * row_bytes, row_bytes);
 }
+#endif
 } // namespace
 
 TEST(Quant, q4_k_w4a8_matches_f32_path) {
@@ -563,6 +566,7 @@ TEST(Quant, q4_k_plain_4rows_q8k_matches_single_row) {
         EXPECT_EQ(bits(got[o]), bits(want)) << "row " << o << ": " << got[o] << " vs " << want;
     }
 }
+#endif
 
 // ── Q5_K, Q6_K f32 (Task 4) ───────────────────────────────────────────────────
 
@@ -1016,6 +1020,4 @@ TEST(Quant, q6_k_r4_q8k_kernels_match_single_row) {
         }
     }
 }
-#endif
-
 #endif

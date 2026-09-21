@@ -22,5 +22,11 @@ if(SAPIENT_BUILD_TESTS)
   # needs its own ctest entry; the `GoldenQuant.*_q8k_off` gtests skip under the default env.
   add_test(NAME sapient_backends_cpu_tests.q8k_off
            COMMAND sapient_backends_cpu_tests --gtest_filter=GoldenQuant.*_q8k_off)
-  set_tests_properties(sapient_backends_cpu_tests.q8k_off PROPERTIES ENVIRONMENT "SAPIENT_Q8K_ACT=0")
+  # Guard against the ENVIRONMENT property silently stopping application (e.g. a ctest/CMake
+  # regression): if the twelve `_q8k_off` cases ever run with the knob still ON, they GTEST_SKIP()
+  # with this exact text (golden_quant_test.cpp:76) instead of exercising the off path, and gtest
+  # exits 0 either way — so a vacuous pass must fail the ctest entry on the skip text itself.
+  set_tests_properties(sapient_backends_cpu_tests.q8k_off PROPERTIES
+                        ENVIRONMENT "SAPIENT_Q8K_ACT=0"
+                        FAIL_REGULAR_EXPRESSION "needs SAPIENT_Q8K_ACT=0")
 endif()
