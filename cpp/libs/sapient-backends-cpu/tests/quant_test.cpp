@@ -695,10 +695,12 @@ Stats stats(std::vector<float>& v) {
     return {sum / static_cast<float>(v.size()), v[v.size() / 2], v.back()};
 }
 // quant.rs q6_k_test_rows: random bytes with a small positive f16 d at [208..210).
+// Advances seed on EVERY byte (including [208..210)), matching Rust's per-byte cadence.
 std::vector<uint8_t> q6_k_test_rows(size_t n, size_t k, uint64_t seed) {
     const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
     std::vector<uint8_t> rows(n * row_bytes);
     for (size_t i = 0; i < rows.size(); ++i) {
+        const uint64_t s = lcg_step(seed);
         switch (i % Q6_K_BLOCK_BYTES) {
         case 208:
             rows[i] = 0x11;
@@ -707,7 +709,7 @@ std::vector<uint8_t> q6_k_test_rows(size_t n, size_t k, uint64_t seed) {
             rows[i] = 0x2c;
             break;
         default:
-            rows[i] = static_cast<uint8_t>(lcg_step(seed) >> 33);
+            rows[i] = static_cast<uint8_t>(s >> 33);
         }
     }
     return rows;
@@ -926,7 +928,7 @@ TEST(Quant, q6_k_w6a8_close_to_f32_path) {
     const float exact = dot_q6_k_row_f32(rows, x);
     const float w6a8 = dot_q6_k_row_q8_scalar(rows, xq.q, xq.scales);
     const float rel = ::fabsf(w6a8 - exact) / ::fmaxf(::fabsf(exact), 1e-3f);
-    EXPECT_LT(rel, 4e-2f) << "W6A8 vs f32: " << w6a8 << " vs " << exact << " (rel " << rel << ")";
+    EXPECT_LT(rel, 2e-2f) << "W6A8 vs f32: " << w6a8 << " vs " << exact << " (rel " << rel << ")";
 }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
