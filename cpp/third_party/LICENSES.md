@@ -4,17 +4,17 @@ Every dependency pinned in `cpp/cmake/deps.cmake` (or linked from the system) is
 its licence. All are compatible with SAPIENT's AGPL-3.0-only OR commercial dual licence; none is
 copyleft-incompatible or bundles its own model weights. `NOTICE` points here.
 
-## Pinned now (sub-project 0)
+## Pinned now (sub-project 0, 1a)
 
 | Component | Version / tag | Licence | Used for | Where |
 |---|---|---|---|---|
 | GoogleTest | v1.15.2 | BSD-3-Clause | unit tests (`SAPIENT_BUILD_TESTS` only, not shipped) | `cmake/deps.cmake` |
+| tl::expected (TartanLlama) | v1.1.0 | CC0-1.0 | `sapient::core::Result<T>` until std::expected | `cmake/deps.cmake` |
 
 ## Planned (spec §D4 — add the row when the pin lands, not before)
 
 | Component | Licence | Used for | Sub-project |
 |---|---|---|---|
-| tl::expected (TartanLlama) | CC0-1.0 | `sapient::Result<T>` until std::expected | 1a |
 | nlohmann/json | MIT | config.json / tokenizer.json / HTTP bodies | 1b |
 | PCRE2 | BSD-3-Clause | tokenizer pre-tokenizer regexes | 1b |
 | minja (ggml-org) | MIT | Jinja chat templates | 1b |

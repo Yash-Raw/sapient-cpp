@@ -13,3 +13,12 @@ if(SAPIENT_BUILD_TESTS)
   set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
 endif()
+
+# tl::expected — std::expected polyfill (C++23) used as sapient::core::Result<T>. CC0-1.0.
+FetchContent_Declare(tl_expected
+  GIT_REPOSITORY https://github.com/TartanLlama/expected.git
+  GIT_TAG        v1.1.0
+  GIT_SHALLOW    TRUE)
+set(EXPECTED_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(EXPECTED_BUILD_PACKAGE OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(tl_expected)
