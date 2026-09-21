@@ -1691,6 +1691,473 @@ std::vector<uint8_t> repack_q6_k_rows4(std::span<const uint8_t> blocks, size_t n
     return out;
 }
 
-// ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ────────────────────────────────────
+// ── Q6_K W6A8 / Q8_K / SMMLA (quant.rs:1757-1998, 2030-2206, 2315-2562) ─────
+
+namespace {
+// Scalar 6-bit reconstruction of element `b = l0 + l` for sub-position `sub` (the `match sub`).
+inline int32_t q6_scalar_q(
+    const uint8_t* ql, const uint8_t* qh, size_t ql_off, size_t qh_off, size_t sub, size_t b) {
+    switch (sub) {
+    case 0:
+        return static_cast<int32_t>((ql[ql_off + b] & 0x0F) | ((qh[qh_off + b] & 3) << 4));
+    case 1:
+        return static_cast<int32_t>((ql[ql_off + b + 32] & 0x0F) |
+                                    (((qh[qh_off + b] >> 2) & 3) << 4));
+    case 2:
+        return static_cast<int32_t>((ql[ql_off + b] >> 4) | (((qh[qh_off + b] >> 4) & 3) << 4));
+    default:
+        return static_cast<int32_t>((ql[ql_off + b + 32] >> 4) |
+                                    (((qh[qh_off + b] >> 6) & 3) << 4));
+    }
+}
+// (sub, sc_off, x_add) — the four 16-element scale groups at x offsets +0 / +32 / +64 / +96.
+constexpr size_t Q6_SC_OFF[4] = {0, 2, 4, 6};
+constexpr size_t Q6_X_ADD[4] = {0, 32, 64, 96};
+
+#if SAPIENT_AARCH64
+// Rust `group!`: dot = vaddvq_s32(sdot(0, q − 32, xv)) — the −32 applied in i8 before the dot.
+SAPIENT_TARGET_DOTPROD inline int32_t q6_group_dot(uint8x16_t q, int8x16_t xv) {
+    const int8x16_t qm = vsubq_s8(vreinterpretq_s8_u8(q), vdupq_n_s8(32));
+    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), qm, xv));
+}
+#endif
+} // namespace
+
+float dot_q6_k_row_q8_scalar(std::span<const uint8_t> row_data,
+                             std::span<const int8_t> x_i8,
+                             std::span<const float> x_scales) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, QK_K / QK, "dot_q6_k_row_q8_scalar: activations shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                for (size_t sub = 0; sub < 4; ++sub) {
+                    int32_t dot = 0;
+                    for (size_t l = 0; l < 16; ++l) {
+                        const int32_t q = q6_scalar_q(ql, qh, ql_off, qh_off, sub, l0 + l);
+                        const size_t xi = x_off + Q6_X_ADD[sub] + l0 + l;
+                        dot += (q - 32) * static_cast<int32_t>(x_i8[xi]);
+                    }
+                    const float xs = x_scales[(x_off + Q6_X_ADD[sub] + l0) / QK];
+                    acc += d * q6_scale(sc, sc_base + is + Q6_SC_OFF[sub]) * xs *
+                           static_cast<float>(dot);
+                }
+            }
+            x_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+    }
+    return acc;
+}
+
+float dot_q6_k_row_q8k_scalar(std::span<const uint8_t> row_data,
+                              std::span<const int8_t> x_i8,
+                              std::span<const float> x_scales) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, 1, "dot_q6_k_row_q8k_scalar: activations shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        int32_t isum = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                for (size_t sub = 0; sub < 4; ++sub) {
+                    int32_t dot = 0;
+                    for (size_t l = 0; l < 16; ++l) {
+                        const int32_t q = q6_scalar_q(ql, qh, ql_off, qh_off, sub, l0 + l);
+                        const size_t xi = xo + Q6_X_ADD[sub] + l0 + l;
+                        dot += (q - 32) * static_cast<int32_t>(x_i8[xi]);
+                    }
+                    isum += detail::i8v(sc[sc_base + is + Q6_SC_OFF[sub]]) * dot;
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        acc += x_scales[bi] * d * static_cast<float>(isum);
+        x_off += QK_K;
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+SAPIENT_TARGET_DOTPROD float dot_q6_k_row_q8_neon(std::span<const uint8_t> row_data,
+                                                  std::span<const int8_t> x_i8,
+                                                  std::span<const float> x_scales) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, QK_K / QK, "dot_q6_k_row_q8_neon: activations shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                uint8x16_t q[4];
+                q6_unpack(ql, qh, ql_off, qh_off, l0, q);
+                for (size_t sub = 0; sub < 4;
+                     ++sub) { // group!(q1,0,0) (q2,2,32) (q3,4,64) (q4,6,96)
+                    const size_t xi = x_off + Q6_X_ADD[sub] + l0;
+                    const int8x16_t xv = vld1q_s8(x_i8.data() + xi);
+                    const int32_t dot = q6_group_dot(q[sub], xv);
+                    const float xs = x_scales[xi / QK];
+                    acc += d * q6_scale(sc, sc_base + is + Q6_SC_OFF[sub]) * xs *
+                           static_cast<float>(dot);
+                }
+            }
+            x_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+    }
+    return acc;
+}
+
+SAPIENT_TARGET_DOTPROD float dot_q6_k_row_q8k_neon(std::span<const uint8_t> row_data,
+                                                   std::span<const int8_t> x_i8,
+                                                   std::span<const float> x_scales) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_q8_row(nb, x_i8, x_scales, 1, "dot_q6_k_row_q8k_neon: activations shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        int32_t isum = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                uint8x16_t q[4];
+                q6_unpack(ql, qh, ql_off, qh_off, l0, q);
+                for (size_t sub = 0; sub < 4; ++sub) {
+                    const size_t xi = xo + Q6_X_ADD[sub] + l0;
+                    const int8x16_t xv = vld1q_s8(x_i8.data() + xi);
+                    const int32_t dot = q6_group_dot(q[sub], xv);
+                    isum += detail::i8v(sc[sc_base + is + Q6_SC_OFF[sub]]) * dot;
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        acc += x_scales[bi] * d * static_cast<float>(isum);
+        x_off += QK_K;
+    }
+    return acc;
+}
+
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q6_k_4rows_r4_q8_neon(std::span<const uint8_t> packed,
+                          std::span<const int8_t> x_i8,
+                          std::span<const float> x_scales) {
+    const size_t nb = packed.size() / (4 * Q6_K_BLOCK_BYTES);
+    check_q8_row(nb,
+                 x_i8,
+                 x_scales,
+                 QK_K / QK,
+                 "dot_q6_k_4rows_r4_q8_neon: activations shorter than the row");
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t gbase = b * 4 * Q6_K_BLOCK_BYTES;
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                // Shared activation vectors + scales for the four 16-groups.
+                int8x16_t xv[4];
+                float xs[4];
+                for (size_t sub = 0; sub < 4; ++sub) {
+                    xv[sub] = vld1q_s8(x_i8.data() + xo + Q6_X_ADD[sub] + l0);
+                    xs[sub] = x_scales[(xo + Q6_X_ADD[sub] + l0) / QK];
+                }
+                for (size_t r = 0; r < 4; ++r) {
+                    const uint8_t* block = packed.data() + gbase + r * Q6_K_BLOCK_BYTES;
+                    const uint8_t* sc = block + 192;
+                    const float d = f16_le_to_f32(block + 208);
+                    uint8x16_t q[4];
+                    q6_unpack(block, block + 128, ql_off, qh_off, l0, q);
+                    for (size_t sub = 0; sub < 4; ++sub) {
+                        const int32_t dot = q6_group_dot(q[sub], xv[sub]);
+                        acc[r] += d * q6_scale(sc, sc_base + is + Q6_SC_OFF[sub]) * xs[sub] *
+                                  static_cast<float>(dot);
+                    }
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        x_off += QK_K;
+    }
+    return acc;
+}
+
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q6_k_4rows_r4_q8k_neon(std::span<const uint8_t> packed,
+                           std::span<const int8_t> x_i8,
+                           std::span<const float> x_scales) {
+    const size_t nb = packed.size() / (4 * Q6_K_BLOCK_BYTES);
+    const size_t nb_eff = std::min(nb, x_scales.size()); // .take(nb)
+    check_len(x_i8.size(), nb_eff * QK_K, "dot_q6_k_4rows_r4_q8k_neon: x_i8 shorter than the row");
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb_eff; ++b) {
+        const float db = x_scales[b];
+        const size_t gbase = b * 4 * Q6_K_BLOCK_BYTES;
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        int32_t isum[4] = {0, 0, 0, 0};
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                int8x16_t xv[4];
+                for (size_t sub = 0; sub < 4; ++sub)
+                    xv[sub] = vld1q_s8(x_i8.data() + xo + Q6_X_ADD[sub] + l0);
+                for (size_t r = 0; r < 4; ++r) {
+                    const uint8_t* block = packed.data() + gbase + r * Q6_K_BLOCK_BYTES;
+                    const uint8_t* sc = block + 192;
+                    uint8x16_t q[4];
+                    q6_unpack(block, block + 128, ql_off, qh_off, l0, q);
+                    for (size_t sub = 0; sub < 4; ++sub) {
+                        const int32_t dot = q6_group_dot(q[sub], xv[sub]);
+                        isum[r] += detail::i8v(sc[sc_base + is + Q6_SC_OFF[sub]]) * dot;
+                    }
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        for (size_t r = 0; r < 4; ++r) {
+            const float d = f16_le_to_f32(packed.data() + gbase + r * Q6_K_BLOCK_BYTES + 208);
+            acc[r] += db * d * static_cast<float>(isum[r]);
+        }
+        x_off += QK_K;
+    }
+    return acc;
+}
+
+namespace {
+// The i8 (q − 32) groups of one row for one 16-lane position — shared by both SMMLA kernels.
+SAPIENT_TARGET_I8MM inline void
+q6_unpack_m32(const uint8_t* block, size_t ql_off, size_t qh_off, size_t l0, int8x16_t qm[4]) {
+    uint8x16_t q[4];
+    q6_unpack(block, block + 128, ql_off, qh_off, l0, q);
+    const int8x16_t m32 = vdupq_n_s8(32);
+    for (size_t g = 0; g < 4; ++g)
+        qm[g] = vsubq_s8(vreinterpretq_s8_u8(q[g]), m32);
+}
+// [w_r0_seg, w_r1_seg] × [x0_seg, x1_seg] per 8-byte half → lanes [r0·x0, r0·x1, r1·x0, r1·x1].
+SAPIENT_TARGET_I8MM inline void
+q6_smmla_pair(int8x16_t w0, int8x16_t w1, int8x16_t x0, int8x16_t x1, int32_t dots[4]) {
+    const int8x16_t wa = vtrn1q_s64_s8(w0, w1);
+    const int8x16_t wb = vtrn2q_s64_s8(w0, w1);
+    const int8x16_t xa = vtrn1q_s64_s8(x0, x1);
+    const int8x16_t xb = vtrn2q_s64_s8(x0, x1);
+    const int32x4_t d2 = smmla_s32(smmla_s32(vdupq_n_s32(0), wa, xa), wb, xb);
+    dots[0] = vgetq_lane_s32(d2, 0);
+    dots[1] = vgetq_lane_s32(d2, 1);
+    dots[2] = vgetq_lane_s32(d2, 2);
+    dots[3] = vgetq_lane_s32(d2, 3);
+}
+} // namespace
+
+// Four R4 Q6_K rows × TWO per-32 int8 activation rows via `smmla` (quant.rs:2315-2444): per
+// 16-element scale group, two trn shuffles + two smmla per weight-row pair; combine order is
+// dot_q6_k_row_q8_neon's, so all 8 lanes are bit-identical to it.
+SAPIENT_TARGET_I8MM std::array<std::array<float, 2>, 4>
+dot_q6_k_4rows_r4_x2_smmla(std::span<const uint8_t> packed,
+                           std::span<const int8_t> x0_i8,
+                           std::span<const float> x0_scales,
+                           std::span<const int8_t> x1_i8,
+                           std::span<const float> x1_scales) {
+    const size_t nb = packed.size() / (4 * Q6_K_BLOCK_BYTES);
+    check_q8_row(
+        nb, x0_i8, x0_scales, QK_K / QK, "dot_q6_k_4rows_r4_x2_smmla: x0 shorter than the row");
+    check_q8_row(
+        nb, x1_i8, x1_scales, QK_K / QK, "dot_q6_k_4rows_r4_x2_smmla: x1 shorter than the row");
+    std::array<std::array<float, 2>, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t gbase = b * 4 * Q6_K_BLOCK_BYTES;
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                // Both activation rows' vectors for the four 16-groups, once.
+                int8x16_t x0v[4];
+                int8x16_t x1v[4];
+                float xs0[4];
+                float xs1[4];
+                for (size_t g = 0; g < 4; ++g) {
+                    x0v[g] = vld1q_s8(x0_i8.data() + xo + Q6_X_ADD[g] + l0);
+                    x1v[g] = vld1q_s8(x1_i8.data() + xo + Q6_X_ADD[g] + l0);
+                    xs0[g] = x0_scales[(xo + Q6_X_ADD[g] + l0) / QK];
+                    xs1[g] = x1_scales[(xo + Q6_X_ADD[g] + l0) / QK];
+                }
+                for (size_t pair = 0; pair < 2; ++pair) {
+                    const size_t r0 = pair * 2;
+                    const size_t r1 = pair * 2 + 1;
+                    const uint8_t* blk0 = packed.data() + gbase + r0 * Q6_K_BLOCK_BYTES;
+                    const uint8_t* blk1 = packed.data() + gbase + r1 * Q6_K_BLOCK_BYTES;
+                    int8x16_t qm0[4];
+                    int8x16_t qm1[4];
+                    q6_unpack_m32(blk0, ql_off, qh_off, l0, qm0);
+                    q6_unpack_m32(blk1, ql_off, qh_off, l0, qm1);
+                    for (size_t g = 0; g < 4; ++g) {
+                        int32_t dots[4];
+                        q6_smmla_pair(qm0[g], qm1[g], x0v[g], x1v[g], dots);
+                        const size_t sc_off = is + 2 * g;
+                        const size_t rows2[2] = {r0, r1};
+                        for (size_t ri = 0; ri < 2; ++ri) {
+                            const uint8_t* blk =
+                                packed.data() + gbase + rows2[ri] * Q6_K_BLOCK_BYTES;
+                            const float d = f16_le_to_f32(blk + 208);
+                            const float scv = q6_scale(blk + 192, sc_base + sc_off);
+                            acc[rows2[ri]][0] +=
+                                d * scv * xs0[g] * static_cast<float>(dots[ri * 2]);
+                            acc[rows2[ri]][1] +=
+                                d * scv * xs1[g] * static_cast<float>(dots[ri * 2 + 1]);
+                        }
+                    }
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        x_off += QK_K;
+    }
+    return acc;
+}
+
+// Same core, integer-domain combine of dot_q6_k_row_q8k_neon (quant.rs:2446-2562).
+SAPIENT_TARGET_I8MM std::array<std::array<float, 2>, 4>
+dot_q6_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
+                               std::span<const int8_t> x0_i8,
+                               std::span<const float> x0_scales,
+                               std::span<const int8_t> x1_i8,
+                               std::span<const float> x1_scales) {
+    const size_t nb = packed.size() / (4 * Q6_K_BLOCK_BYTES);
+    const size_t nb_eff = std::min({nb, x0_scales.size(), x1_scales.size()}); // zip().take(nb)
+    check_len(
+        x0_i8.size(), nb_eff * QK_K, "dot_q6_k_4rows_r4_x2_q8k_smmla: x0 shorter than the row");
+    check_len(
+        x1_i8.size(), nb_eff * QK_K, "dot_q6_k_4rows_r4_x2_q8k_smmla: x1 shorter than the row");
+    std::array<std::array<float, 2>, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb_eff; ++b) {
+        const float db0 = x0_scales[b];
+        const float db1 = x1_scales[b];
+        const size_t gbase = b * 4 * Q6_K_BLOCK_BYTES;
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        size_t xo = x_off;
+        int32_t isum[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                int8x16_t x0v[4];
+                int8x16_t x1v[4];
+                for (size_t g = 0; g < 4; ++g) {
+                    x0v[g] = vld1q_s8(x0_i8.data() + xo + Q6_X_ADD[g] + l0);
+                    x1v[g] = vld1q_s8(x1_i8.data() + xo + Q6_X_ADD[g] + l0);
+                }
+                for (size_t pair = 0; pair < 2; ++pair) {
+                    const size_t r0 = pair * 2;
+                    const size_t r1 = pair * 2 + 1;
+                    const uint8_t* blk0 = packed.data() + gbase + r0 * Q6_K_BLOCK_BYTES;
+                    const uint8_t* blk1 = packed.data() + gbase + r1 * Q6_K_BLOCK_BYTES;
+                    int8x16_t qm0[4];
+                    int8x16_t qm1[4];
+                    q6_unpack_m32(blk0, ql_off, qh_off, l0, qm0);
+                    q6_unpack_m32(blk1, ql_off, qh_off, l0, qm1);
+                    for (size_t g = 0; g < 4; ++g) {
+                        int32_t dots[4];
+                        q6_smmla_pair(qm0[g], qm1[g], x0v[g], x1v[g], dots);
+                        const size_t sc_off = is + 2 * g;
+                        const size_t rows2[2] = {r0, r1};
+                        for (size_t ri = 0; ri < 2; ++ri) {
+                            const uint8_t* blk =
+                                packed.data() + gbase + rows2[ri] * Q6_K_BLOCK_BYTES;
+                            const int32_t scv = detail::i8v(blk[192 + sc_base + sc_off]);
+                            isum[rows2[ri]][0] += scv * dots[ri * 2];
+                            isum[rows2[ri]][1] += scv * dots[ri * 2 + 1];
+                        }
+                    }
+                }
+            }
+            xo += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+        for (size_t row = 0; row < 4; ++row) {
+            const float d = f16_le_to_f32(packed.data() + gbase + row * Q6_K_BLOCK_BYTES + 208);
+            acc[row][0] += db0 * d * static_cast<float>(isum[row][0]);
+            acc[row][1] += db1 * d * static_cast<float>(isum[row][1]);
+        }
+        x_off += QK_K;
+    }
+    return acc;
+}
+#endif
 
 } // namespace sapient::backends_cpu::kernels::quant

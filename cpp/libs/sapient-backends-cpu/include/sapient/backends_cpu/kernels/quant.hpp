@@ -228,5 +228,49 @@ float dot_q6_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const f
 } // namespace detail
 
 // ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ───────────────────────────────────────────
+/// W6A8 scalar reference: per 16-element scale group `acc += ((d · sc) · xs) · dot` with the −32
+/// folded into the integer dot; `x_scales` one per 32.
+float dot_q6_k_row_q8_scalar(std::span<const uint8_t> row_data,
+                             std::span<const int8_t> x_i8,
+                             std::span<const float> x_scales);
+/// Q8_K scalar oracle: `isum += sc · dot` (i32) across the super-block, then
+/// `acc += x_scales[b] · d · isum`; `x_scales` one per 256.
+float dot_q6_k_row_q8k_scalar(std::span<const uint8_t> row_data,
+                              std::span<const int8_t> x_i8,
+                              std::span<const float> x_scales);
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// One `sdot` per 16-element group; bit-identical to `dot_q6_k_row_q8_scalar`. Precondition: dotprod.
+float dot_q6_k_row_q8_neon(std::span<const uint8_t> row_data,
+                           std::span<const int8_t> x_i8,
+                           std::span<const float> x_scales);
+/// Bit-identical to `dot_q6_k_row_q8k_scalar`. Precondition: dotprod.
+float dot_q6_k_row_q8k_neon(std::span<const uint8_t> row_data,
+                            std::span<const int8_t> x_i8,
+                            std::span<const float> x_scales);
+/// Four R4 rows, W6A8; lanes bit-identical to `dot_q6_k_row_q8_neon`. Precondition: dotprod.
+std::array<float, 4> dot_q6_k_4rows_r4_q8_neon(std::span<const uint8_t> packed,
+                                               std::span<const int8_t> x_i8,
+                                               std::span<const float> x_scales);
+/// Four R4 rows × one Q8_K row; lanes bit-identical to `dot_q6_k_row_q8k_neon`; iterates
+/// `min(nb, x_scales.size())` blocks. Precondition: dotprod.
+std::array<float, 4> dot_q6_k_4rows_r4_q8k_neon(std::span<const uint8_t> packed,
+                                                std::span<const int8_t> x_i8,
+                                                std::span<const float> x_scales);
+/// Four R4 rows × TWO per-32 int8 rows via `smmla`; lanes bit-identical to `dot_q6_k_row_q8_neon`
+/// (no sums — Q6_K has no min term). Precondition: i8mm.
+std::array<std::array<float, 2>, 4> dot_q6_k_4rows_r4_x2_smmla(std::span<const uint8_t> packed,
+                                                               std::span<const int8_t> x0_i8,
+                                                               std::span<const float> x0_scales,
+                                                               std::span<const int8_t> x1_i8,
+                                                               std::span<const float> x1_scales);
+/// Four R4 rows × TWO Q8_K rows via `smmla`; lanes bit-identical to `dot_q6_k_row_q8k_neon`;
+/// iterates `min(nb, x0_scales.size(), x1_scales.size())` blocks. Precondition: i8mm.
+std::array<std::array<float, 2>, 4>
+dot_q6_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
+                               std::span<const int8_t> x0_i8,
+                               std::span<const float> x0_scales,
+                               std::span<const int8_t> x1_i8,
+                               std::span<const float> x1_scales);
+#endif
 
 } // namespace sapient::backends_cpu::kernels::quant

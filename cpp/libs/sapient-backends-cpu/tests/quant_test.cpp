@@ -881,4 +881,139 @@ TEST(QuantDeath, repack_q6_k_rows4_asserts_like_rust) {
     const std::vector<uint8_t> two_rows(2 * Q6_K_BLOCK_BYTES, 0);
     EXPECT_DEATH((void)repack_q6_k_rows4(two_rows, 2, 256), "multiple of 4");
 }
+
+// ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ─────────────────────────────────────────
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q6_k_w6a8_neon_matches_scalar) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t k = 512;
+    const auto rows = q6_k_test_rows(2, k, 0x0666ULL);
+    const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
+    const auto x = ramp(k, 29, 71, 35.0f, 0.03f);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    for (size_t r = 0; r < 2; ++r) {
+        const auto row = row_of(rows, r, row_bytes);
+        const float want = dot_q6_k_row_q8_scalar(row, xq.q, xq.scales);
+        const float got = dot_q6_k_row_q8_neon(row, xq.q, xq.scales);
+        EXPECT_EQ(bits(got), bits(want)) << "row " << r << ": " << got << " vs " << want;
+    }
+}
+
+TEST(Quant, q6_k_w6a8_r4_matches_single_row) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t n = 4, k = 512;
+    const auto rows = q6_k_test_rows(n, k, 0x0667ULL);
+    const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
+    const auto x = ramp(k, 31, 67, 33.0f, 0.03f);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    const auto packed = repack_q6_k_rows4(rows, n, k);
+    const auto got = dot_q6_k_4rows_r4_q8_neon(packed, xq.q, xq.scales);
+    for (size_t r = 0; r < 4; ++r) {
+        const float want = dot_q6_k_row_q8_neon(row_of(rows, r, row_bytes), xq.q, xq.scales);
+        EXPECT_EQ(bits(got[r]), bits(want)) << "row " << r << ": " << got[r] << " vs " << want;
+    }
+}
+#endif
+
+TEST(Quant, q6_k_w6a8_close_to_f32_path) {
+    // Activation quantization is per-32-block int8 — same accuracy class as the accepted Q4_K
+    // W4A8 path. Bound the relative error vs the exact f32-activation dot.
+    const size_t k = 512;
+    const auto rows = q6_k_test_rows(1, k, 0x0668ULL);
+    const auto x = ramp(k, 43, 91, 45.0f, 0.02f);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    const float exact = dot_q6_k_row_f32(rows, x);
+    const float w6a8 = dot_q6_k_row_q8_scalar(rows, xq.q, xq.scales);
+    const float rel = ::fabsf(w6a8 - exact) / ::fmaxf(::fabsf(exact), 1e-3f);
+    EXPECT_LT(rel, 4e-2f) << "W6A8 vs f32: " << w6a8 << " vs " << exact << " (rel " << rel << ")";
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q6_k_smmla_x2_matches_single_row) {
+    if (!has_i8mm()) GTEST_SKIP() << "i8mm not available";
+    const size_t n = 4, k = 512;
+    const auto rows = q6_k_test_rows(n, k, 0x68AAULL);
+    const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
+    const auto x0 = ramp(k, 37, 97, 48.0f, 0.02f);
+    const auto x1 = ramp(k, 61, 103, 51.0f, 0.015f);
+    const auto q0 = quantize_row_to_i8_blocks(x0);
+    const auto q1 = quantize_row_to_i8_blocks(x1);
+    const auto packed = repack_q6_k_rows4(rows, n, k);
+    const auto got = dot_q6_k_4rows_r4_x2_smmla(packed, q0.q, q0.scales, q1.q, q1.scales);
+    for (size_t r = 0; r < 4; ++r) {
+        const auto row = row_of(rows, r, row_bytes);
+        const float w0 = dot_q6_k_row_q8_neon(row, q0.q, q0.scales);
+        const float w1 = dot_q6_k_row_q8_neon(row, q1.q, q1.scales);
+        EXPECT_EQ(bits(got[r][0]), bits(w0)) << "row " << r << " x0: " << got[r][0] << " vs " << w0;
+        EXPECT_EQ(bits(got[r][1]), bits(w1)) << "row " << r << " x1: " << got[r][1] << " vs " << w1;
+    }
+}
+#endif
+
+TEST(Quant, q6_k_q8k_scalar_matches_f32_path) {
+    const size_t nblocks = 2;
+    std::vector<uint8_t> row(nblocks * Q6_K_BLOCK_BYTES);
+    for (size_t i = 0; i < row.size(); ++i)
+        row[i] = static_cast<uint8_t>((i * 181 + 17) % 251);
+    for (size_t blk = 0; blk < nblocks; ++blk)
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.05f),
+                                 row.data() + blk * Q6_K_BLOCK_BYTES + 208);
+    const auto x = ramp(nblocks * QK_K, 43, 107, 53.0f, 0.02f);
+    const float f32_dot = dot_q6_k_row_f32(row, x);
+    const auto k8 = quantize_row_to_q8k(x);
+    const float q8k = dot_q6_k_row_q8k_scalar(row, k8.q, k8.scales);
+    const float rel = ::fabsf(f32_dot - q8k) / ::fmaxf(::fabsf(f32_dot), 1e-3f);
+    EXPECT_LT(rel, 0.03f) << "Q6_K Q8_K vs f32: " << f32_dot << " vs " << q8k << " rel=" << rel;
+
+    // Accuracy class vs the accepted per-32 W6A8 path.
+    const auto p = quantize_row_to_i8_blocks(x);
+    const float w6a8 = dot_q6_k_row_q8_scalar(row, p.q, p.scales);
+    const float rel_vs = ::fabsf(w6a8 - q8k) / ::fmaxf(::fabsf(w6a8), 1e-3f);
+    EXPECT_LT(rel_vs, 0.03f) << "Q6_K Q8_K vs W6A8: " << w6a8 << " vs " << q8k << " rel=" << rel_vs;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (has_dotprod()) {
+        const float neon = dot_q6_k_row_q8k_neon(row, k8.q, k8.scales);
+        EXPECT_EQ(bits(neon), bits(q8k)) << "NEON≠scalar: " << neon << " vs " << q8k;
+    }
+#endif
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q6_k_r4_q8k_kernels_match_single_row) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / QK_K * Q6_K_BLOCK_BYTES;
+    std::vector<uint8_t> rows(n * row_bytes);
+    for (size_t i = 0; i < rows.size(); ++i)
+        rows[i] = static_cast<uint8_t>((i * 157 + 31) % 253);
+    for (size_t r = 0; r < n; ++r)
+        for (size_t blk = 0; blk < k / QK_K; ++blk)
+            sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.04f),
+                                     rows.data() + r * row_bytes + blk * Q6_K_BLOCK_BYTES + 208);
+    const auto x0 = ramp(k, 37, 97, 48.0f, 0.02f);
+    const auto x1 = ramp(k, 61, 89, 44.0f, 0.015f);
+    const auto r0 = quantize_row_to_q8k(x0);
+    const auto r1 = quantize_row_to_q8k(x1);
+    const auto packed = repack_q6_k_rows4(rows, n, k);
+
+    const auto got4 = dot_q6_k_4rows_r4_q8k_neon(packed, r0.q, r0.scales);
+    for (size_t r = 0; r < 4; ++r) {
+        const float want = dot_q6_k_row_q8k_neon(row_of(rows, r, row_bytes), r0.q, r0.scales);
+        EXPECT_EQ(bits(got4[r]), bits(want)) << "r4 row " << r << ": " << got4[r] << " vs " << want;
+    }
+    if (has_i8mm()) {
+        const auto got = dot_q6_k_4rows_r4_x2_q8k_smmla(packed, r0.q, r0.scales, r1.q, r1.scales);
+        for (size_t r = 0; r < 4; ++r) {
+            const auto row = row_of(rows, r, row_bytes);
+            const float w0 = dot_q6_k_row_q8k_neon(row, r0.q, r0.scales);
+            const float w1 = dot_q6_k_row_q8k_neon(row, r1.q, r1.scales);
+            EXPECT_EQ(bits(got[r][0]), bits(w0)) << "smmla row " << r << " x0";
+            EXPECT_EQ(bits(got[r][1]), bits(w1)) << "smmla row " << r << " x1";
+        }
+    }
+}
+#endif
+
 #endif
