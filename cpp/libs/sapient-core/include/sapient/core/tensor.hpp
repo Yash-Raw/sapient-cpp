@@ -54,9 +54,10 @@ public:
 
     std::span<const uint8_t> bytes() const;
     std::span<const uint8_t> quant_blocks() const; // panics unless is_quantized(dtype)
-    // panics unless F32; unbounded. Truncates any trailing < 4 bytes rather than panicking (see
-    // bytes_bounded_for_quant_unbounded_for_float in tensor_test.cpp) — this interface contract is
-    // authoritative over the stricter "len % 4 == 0" comment that used to sit on this declaration.
+    // panics unless F32; unbounded. Rust's `as_f32_slice` additionally asserts `len % 4 == 0`; this
+    // port truncates instead of panicking on a non-multiple remainder — see
+    // bytes_bounded_for_quant_unbounded_for_float in tensor_test.cpp (a deliberate C++-vs-Rust
+    // divergence, not yet recorded in docs/PARITY.md — flagged in the task-7 report).
     std::span<const float> f32_slice() const;
     std::vector<float> to_contiguous_f32_vec() const;
     F32Cow to_f32_cow() const;
