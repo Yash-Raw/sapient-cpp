@@ -17,15 +17,17 @@ endif()
 # (e.g. googletest, populated at the top-level directory scope by cmake/deps.cmake) never see it
 # — only libs/apps/ffi CMakeLists.txt files that call sapient_apply_parity_flags_here() do, at
 # their own directory scope (inherited by their add_subdirectory() children).
+# -fno-math-errno: rustc lowers sin/cos/exp/pow/sqrt to LLVM intrinsics (no errno); Clang matches
+# that lowering only with this flag (Darwin default, NOT the Linux default) — plan C ruling.
 function(sapient_apply_parity_flags_here)
   if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     # UCRT marks getenv deprecated; clang-cl reports it as -Wdeprecated-declarations, and our
     # per-target /WX (sapient_apply_warnings) makes that fatal. The port reads SAPIENT_* knobs
     # via getenv, so silence the deprecation instead of avoiding the standard C API.
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-    add_compile_options(/clang:-ffp-contract=off)
+    add_compile_options(/clang:-ffp-contract=off /clang:-fno-math-errno)
   else()
-    add_compile_options(-ffp-contract=off -fno-fast-math)
+    add_compile_options(-ffp-contract=off -fno-fast-math -fno-math-errno)
   endif()
 endfunction()
 
