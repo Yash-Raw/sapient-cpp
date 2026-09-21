@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -154,8 +155,9 @@ Result<Tensor> clip(const Tensor& x, std::optional<float> min, std::optional<flo
 
 // ── Erf approximation (Abramowitz & Stegun), coefficients verbatim from Rust ─────────────
 float erf_approx(float x) {
-    // f32::signum: NaN stays NaN; otherwise ±1 by sign bit (+0.0 → 1, -0.0 → -1).
-    const float sign = std::isnan(x) ? x : ::copysignf(1.0f, x);
+    // f32::signum: NaN input yields the CANONICAL NaN (f32::NAN, 0x7fc00000), not the input payload; otherwise ±1 by sign bit (+0.0 → 1, -0.0 → -1).
+    const float sign =
+        std::isnan(x) ? std::numeric_limits<float>::quiet_NaN() : ::copysignf(1.0f, x);
     x = ::fabsf(x);
     const float t = 1.0f / (1.0f + 0.3275911f * x);
     const float y =

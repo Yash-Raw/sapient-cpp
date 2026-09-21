@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -84,4 +85,11 @@ TEST(Elementwise, error_messages_match_rust) {
     auto s = add(t({1.0f, 2.0f}), t({1.0f, 2.0f, 3.0f}));
     ASSERT_FALSE(s.has_value());
     EXPECT_EQ(s.error().to_string(), "Shape mismatch: expected [2], got [3]");
+}
+
+// C++-only: Rust f32::signum canonicalises NaN (f32::NAN = 0x7fc00000); the payload must not leak through.
+TEST(Elementwise, erf_approx_canonicalises_nan_like_rust_signum) {
+    const float payload_nan = std::bit_cast<float>(0x7fc12345u);
+    EXPECT_EQ(std::bit_cast<uint32_t>(erf_approx(payload_nan)), 0x7fc00000u);
+    EXPECT_LE(erf_approx(-0.0f), 0.0f);
 }
