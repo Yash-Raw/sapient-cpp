@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -233,6 +234,19 @@ TEST(Compare, within_abs_and_max_abs_err) {
     EXPECT_EQ(sapient::testing::max_abs_err(a, b), 0.5f);
     EXPECT_TRUE(sapient::testing::within_abs(a, b, 0.5f));
     EXPECT_FALSE(sapient::testing::within_abs(a, b, 0.4f));
+}
+
+TEST(Compare, within_abs_rejects_nan_where_reference_is_finite) {
+    const float got[] = {1.0f, NAN, 3.0f};
+    const float ref[] = {1.0f, 2.0f, 3.0f};
+    EXPECT_TRUE(std::isinf(sapient::testing::max_abs_err(got, ref)));
+    EXPECT_FALSE(sapient::testing::within_abs(got, ref, 1e30f));
+
+    // Both-NaN at the same index is treated as equal, not a mismatch.
+    const float both_nan_got[] = {NAN};
+    const float both_nan_ref[] = {NAN};
+    EXPECT_EQ(sapient::testing::max_abs_err(both_nan_got, both_nan_ref), 0.0f);
+    EXPECT_TRUE(sapient::testing::within_abs(both_nan_got, both_nan_ref, 0.0f));
 }
 
 TEST(Compare, golden_case_macro_skips_without_env) {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace sapient::testing {
@@ -62,10 +63,25 @@ std::optional<GoldenCase> load_golden_case(std::string_view name, std::string* w
 }
 
 float max_abs_err(std::span<const float> got, std::span<const float> ref) {
-    float m = 0.0f;
+    // Contract unchanged from the original: mismatched lengths compare over the shorter span
+    // (callers that care about length reject it separately, as within_abs does below).
     const size_t n = got.size() < ref.size() ? got.size() : ref.size();
-    for (size_t i = 0; i < n; ++i)
-        m = std::fmax(m, std::fabs(got[i] - ref[i]));
+    float m = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const bool gn = std::isnan(got[i]);
+        const bool rn = std::isnan(ref[i]);
+        // NaN vs finite is a genuine mismatch: IEEE fmax() silently drops the NaN operand and
+        // returns the finite one, which let a NaN-vs-finite divergence contribute 0 error. Fail
+        // it loudly instead of masking it.
+        if (gn != rn) return std::numeric_limits<float>::infinity();
+        if (gn && rn) continue; // both NaN: treated as equal, no error contribution.
+        const float e = std::fabs(got[i] - ref[i]);
+        if (e > m)
+            m = e; // plain compare, not fmax: NaN (e.g. inf - inf, same sign) leaves m
+                   // unchanged rather than being silently absorbed by fmax either way —
+                   // spelled out explicitly here since the NaN-mismatch case above no
+                   // longer relies on fmax's masking behaviour at all.
+    }
     return m;
 }
 
@@ -73,6 +89,11 @@ float max_abs_err(std::span<const float> got, std::span<const float> ref) {
 within_abs(std::span<const float> got, std::span<const float> ref, float tol) {
     if (got.size() != ref.size())
         return ::testing::AssertionFailure() << "length " << got.size() << " != " << ref.size();
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (std::isnan(got[i]) != std::isnan(ref[i]))
+            return ::testing::AssertionFailure()
+                   << "index " << i << ": got " << got[i] << ", ref " << ref[i];
+    }
     const float m = max_abs_err(got, ref);
     if (m <= tol) return ::testing::AssertionSuccess();
     return ::testing::AssertionFailure() << "max abs err " << m << " > " << tol;

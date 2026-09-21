@@ -24,7 +24,16 @@ std::optional<GoldenCase> load_golden_case(std::string_view name, std::string* w
 
 /// Exact comparison on the f32 bit patterns (so NaN payloads and -0 count as differences).
 ::testing::AssertionResult bit_identical(std::span<const float> got, std::span<const float> ref);
+/// Max |got[i] - ref[i]| over the shorter of the two spans (mismatched lengths are not an error
+/// here — `within_abs` below rejects that separately). NaN rule: a NaN in one span where the
+/// other is finite at the same index is a genuine mismatch and returns +infinity (IEEE `fmax`
+/// would silently drop the NaN operand and let it contribute 0 error — not used here for exactly
+/// that reason); a NaN in BOTH spans at the same index is treated as equal (0 error).
 float max_abs_err(std::span<const float> got, std::span<const float> ref);
+/// `max_abs_err(got, ref) <= tol`, plus a length check. On a NaN-vs-finite mismatch, fails with
+/// the first offending index and both values (e.g. "index 17: got nan, ref 0.25") rather than
+/// the generic "max abs err inf > tol", since the source of an infinite error is otherwise
+/// opaque.
 ::testing::AssertionResult
 within_abs(std::span<const float> got, std::span<const float> ref, float tol);
 
