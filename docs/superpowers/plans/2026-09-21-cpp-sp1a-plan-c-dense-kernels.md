@@ -16,6 +16,7 @@
 - **Compiler/flags (programme spec D1 + spec §3.1):** Clang only; `-ffp-contract=off` is applied by `cpp/libs/CMakeLists.txt` to everything under `libs/`; never add `-march=native`/`-ffast-math`. **Ruling (this plan, Task 1): `-fno-math-errno` joins the parity flags** — rustc lowers `sin`/`cos`/`exp`/`pow`/`sqrt` to LLVM intrinsics with no errno; Clang does the same only under `-fno-math-errno`, which is the Darwin default but **not** the Linux default. Without it the `cpp-parity` Linux job may reach different libm entry points (e.g. `sincosf` vs `sinf`+`cosf`) than the Rust build. Build and test with `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev`.
 - **Warnings are errors** (`sapient_apply_warnings`: `-Wall -Wextra -Wpedantic -Wshadow -Werror`). No narrowing in braces, no unused parameters (`conv2d`'s unused `kernel_shape` is `[[maybe_unused]]`), no shadowing (lambdas inside loops: pick distinct names).
 - **CI clang-tidy gate** (`.clang-tidy`, `WarningsAsErrors: '*'`, `bugprone-*`/`performance-*`; LLVM-18 tidy cannot parse this Mac's libc++, so it runs only in CI, which has never run on this branch): avoid the hits plan A took — wrap function-like macros in `NOLINTBEGIN/NOLINTEND(bugprone-macro-parentheses)`, group identical switch arms under shared `case` labels (`bugprone-branch-clone`) — and the ones this plan invites: `bugprone-implicit-widening-of-multiplication-result` (cast operands to `size_t` **before** multiplying: `static_cast<size_t>(a) * b`, never `size_t x = int_a * int_b`), `performance-unnecessary-value-param` (take `std::function` by `const&`), `bugprone-narrowing-conversions` (explicit `static_cast<float>(size_t)`).
+- **Portability of the test binaries:** include the header for every std symbol you use (`<stdexcept>` for `std::runtime_error`, `<algorithm>` for `std::max/min/clamp/fill/find`, `<cstdint>`, `<string>`, `<vector>`, `<optional>`, `<span>`, `<type_traits>`) — transitive includes differ between libc++ (this Mac) and libstdc++/MSVC STL (CI). **No gtest assertion (`ASSERT_*`, `EXPECT_*`, `FAIL()`) inside a lambda handed to `par_for`/`par_chunks_mut`/`for_each_out_chunk`** — gtest assertions are not thread-safe on Windows, and `cpp-build-windows` runs ctest; record into atomics/pre-sized vectors and assert after the call returns.
 - **Formatting:** run the CI-pinned clang-format 18 (`.superpowers/tools-venv/bin/clang-format -i`, or `just cpp-fmt`, which resolves it) on every new/changed `.hpp/.cpp` **after `git add`** (untracked files are invisible to `git ls-files`), then re-add. Homebrew's clang-format 23 disagrees with CI.
 - **Naming (spec D3):** target `sapient_backends_cpu` / alias `sapient::backends_cpu`; headers under `cpp/libs/sapient-backends-cpu/include/sapient/backends_cpu/` (kernels under `kernels/`), sources under `src/` (`src/kernels/`), tests under `tests/` named `<module>_test.cpp`; namespaces mirror the Rust module path exactly (`sapient::backends_cpu::kernels::<module>`, `sapient::backends_cpu::{parallel, cpu_features, thermal, spinpool}`; `sgemm` is a free function in `sapient::backends_cpu`); gtest names are the Rust test names (`TEST(Attention, flash_matches_naive)` …).
 - **SPDX header verbatim** on every new `.hpp/.cpp` (`//` form) and on `CMakeLists.txt`/`.cmake` edits (`#` form); `lint.spdx_headers` fails otherwise:
@@ -151,18 +152,24 @@ TEST(Parallel, par_for_zero_makes_no_calls) {
 }
 
 // rayon: out.par_chunks_mut(64).enumerate() over 1000 elements → chunk ci covers
-// [ci*64, min((ci+1)*64, 1000)); 16 chunks, the last one 40 long.
+// [ci*64, min((ci+1)*64, 1000)); 16 chunks, the last one 40 long. No gtest assertions inside the
+// lambda (it runs on pool threads; gtest assertions are not thread-safe on Windows) — record, then assert.
 TEST(Parallel, par_chunks_mut_partition_matches_rayon) {
     std::vector<float> out(1000, -1.0f);
     std::vector<std::atomic<int>> seen(16);
     for (auto& s : seen) s.store(0);
     std::vector<size_t> lens(16, 0);
+    std::atomic<int> out_of_range{0};
     par_chunks_mut(out, 64, [&](size_t ci, std::span<float> cs) {
-        ASSERT_LT(ci, 16u);
+        if (ci >= 16) {
+            out_of_range.fetch_add(1);
+            return;
+        }
         seen[ci].fetch_add(1);
         lens[ci] = cs.size();
         for (float& v : cs) v = static_cast<float>(ci);
     });
+    EXPECT_EQ(out_of_range.load(), 0);
     for (size_t ci = 0; ci < 16; ++ci) {
         EXPECT_EQ(seen[ci].load(), 1) << "chunk " << ci;
         EXPECT_EQ(lens[ci], ci == 15 ? 40u : 64u) << "chunk " << ci;
@@ -171,16 +178,19 @@ TEST(Parallel, par_chunks_mut_partition_matches_rayon) {
 
     // Exact multiple: one chunk that is the whole slice.
     std::atomic<int> calls{0};
+    std::atomic<int> bad{0};
     par_chunks_mut(out, 1000, [&](size_t ci, std::span<float> cs) {
-        EXPECT_EQ(ci, 0u);
-        EXPECT_EQ(cs.size(), 1000u);
         calls.fetch_add(1);
+        if (ci != 0 || cs.size() != 1000) bad.fetch_add(1);
     });
     EXPECT_EQ(calls.load(), 1);
+    EXPECT_EQ(bad.load(), 0);
 
     // Empty slice: no calls (rayon yields no chunks).
+    std::atomic<int> empty_calls{0};
     std::vector<float> empty;
-    par_chunks_mut(empty, 8, [&](size_t, std::span<float>) { FAIL() << "called on an empty slice"; });
+    par_chunks_mut(empty, 8, [&](size_t, std::span<float>) { empty_calls.fetch_add(1); });
+    EXPECT_EQ(empty_calls.load(), 0);
 }
 
 TEST(Parallel, nested_par_for_completes) {
@@ -732,7 +742,7 @@ size_t parallelism() { return parallel::num_threads(); } // plan E: workers + 1
 - [ ] **Step 7: Build and run the tests**
 
 Run: `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev -R 'CpuFeatures|Parallel'`
-Expected: 7 tests pass (`CpuFeatures.*` 1, `Parallel.*` 5, `ParallelDeath.*` 1). Also run the full suite once (`ctest --preset dev`): the plan A tests still pass with `-fno-math-errno` (79 + 7 = 86 entries).
+Expected: 7 tests pass (`CpuFeatures.*` 1, `Parallel.*` 5, `ParallelDeath.*` 1). Also run the full suite once (`ctest --preset dev`): the plan A tests still pass with `-fno-math-errno` (79 + 7 = 86 entries). **If any plan-A test changes state, STOP and report** — the flag is then the only change on the branch and the controller must rule before Task 2.
 
 - [ ] **Step 8: Format, then commit**
 
@@ -1154,6 +1164,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/elementwise.hpp"
@@ -1507,6 +1519,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/softmax.hpp"
@@ -1573,6 +1586,7 @@ TEST(Softmax, axis_error_message_matches_rust) {
 
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/reduce.hpp"
@@ -1617,6 +1631,7 @@ TEST(Reduce, mean_axis0) {
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/layernorm.hpp"
@@ -1669,6 +1684,7 @@ TEST(LayerNorm, rmsnorm_identity_weight) {
 
 #include <cmath>
 #include <cstddef>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/rope.hpp"
@@ -2346,9 +2362,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 // Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/attention.hpp"
@@ -2822,6 +2840,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/conv2d.hpp"
@@ -3189,9 +3208,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "sapient/backends_cpu/kernels/matmul.hpp"
@@ -3303,8 +3326,10 @@ TEST(Matmul, for_each_out_chunk_partition_matches_rayon) {
         for (float& v : cs) v = static_cast<float>(ci);
     });
     for (size_t i = 0; i < out.size(); ++i) EXPECT_EQ(out[i], static_cast<float>(i / 16)) << i;
+    std::atomic<int> empty_calls{0};
     std::vector<float> empty;
-    detail::for_each_out_chunk(empty, 16, [](size_t, std::span<float>) { FAIL() << "called on empty"; });
+    detail::for_each_out_chunk(empty, 16, [&](size_t, std::span<float>) { empty_calls.fetch_add(1); });
+    EXPECT_EQ(empty_calls.load(), 0);
 }
 
 // m=1, k=512 takes the dot_f32_fast GEMV path (NEON / AVX2 / scalar): check it against a naive dot.
@@ -3828,7 +3853,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | `matmul_nt_f32_m1` (k=64 < 512 → sgemm in Rust too), `matmul_nt_f32_m4`, `conv2d_s1`, `conv2d_s2` | `matrixmultiply::sgemm` | `within_rel_of_max(…, 1e-5f)` |
 | `matmul_nt_{q8_0,q4_k,q6_k}_m{1,3}` | quant arms | **plan D** (not consumed here) |
 
-A bit-identical case that fails is **reported, never loosened**: the implementer returns `DONE_WITH_CONCERNS` with the first mismatching index/bits from `bit_identical`'s message and the case name; the controller rules (a libm difference on this host would be a spec §3.6 finding, a kernel difference a port bug).
+A bit-identical case that fails is **reported, never loosened**: the implementer returns `DONE_WITH_CONCERNS` with the first mismatching index/bits from `bit_identical`'s message and the case name; the controller rules (a libm difference on this host would be a spec §3.6 finding, a kernel difference a port bug). Likeliest culprits, in order: rope (sin/cos lowering), `layer_norm`/`rms_norm` (a `-0.0f` seed applied to — or missing from — the wrong sum), attention (the `raw_s + 0.0f` add skipped when `mask` is null). Never "try `0.0f`" as a fix — the Rust line decides.
 
 - [ ] **Step 1: Extend `dump_kernels.rs`**
 
@@ -4082,14 +4107,22 @@ template <class T>
 ::testing::AssertionResult exact_equal(std::span<const T> got, std::span<const T> ref) {
     if (got.size() != ref.size())
         return ::testing::AssertionFailure() << "length " << got.size() << " != " << ref.size();
-    for (size_t i = 0; i < got.size(); ++i)
-        if (got[i] != ref[i])
-            return ::testing::AssertionFailure()
-                   << "index " << i << ": got " << +got[i] << ", ref " << +ref[i];
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] == ref[i]) continue;
+        auto failure = ::testing::AssertionFailure() << "index " << i << ": got ";
+        // Widen explicitly so int8/uint8 print as numbers; no `+x` promotion (tidy's
+        // bugprone-signed-char-misuse fires on the signed-char → int case).
+        if constexpr (std::is_signed_v<T>)
+            failure << static_cast<long long>(got[i]) << ", ref " << static_cast<long long>(ref[i]);
+        else
+            failure << static_cast<unsigned long long>(got[i]) << ", ref "
+                    << static_cast<unsigned long long>(ref[i]);
+        return failure;
+    }
     return ::testing::AssertionSuccess();
 }
 ```
-(`+got[i]` promotes `int8_t`/`uint8_t` to `int` so they print as numbers.) Also close plan A's parked residual: above `#define SAPIENT_GOLDEN_CASE(var, name)` add the line
+(add `#include <type_traits>` to compare.hpp's includes.) Also close plan A's parked residual: above `#define SAPIENT_GOLDEN_CASE(var, name)` add the line
 ```cpp
 // `__COUNTER__` is expanded twice per invocation — once per generated identifier — and each
 // expansion yields a fresh value, which is exactly what keeps the two names distinct.
@@ -4391,13 +4424,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 9: Docs, parity ledger, `just cpp-tidy`, final verification
 
 **Files:**
-- Modify: `CLAUDE.md`, `docs/ROADMAP.md`, `docs/PARITY.md`, `docs/PROJECT_GUIDE.md`, `CHANGELOG.md`, `justfile`
+- Modify: `CLAUDE.md`, `docs/ROADMAP.md`, `docs/PARITY.md`, `docs/PROJECT_GUIDE.md`, `CHANGELOG.md`, `justfile`, `docs/superpowers/specs/2026-09-21-cpp-sp1a-core-io-cpu-design.md` (one "as built" sentence)
 
-- [ ] **Step 1: CLAUDE.md** — in the `## C++ rewrite programme` section: (a) in the plan-A bullet replace the trailing `Next: plan C (dense kernels).` with `Plan C followed (next bullet).`; (b) append this bullet after it:
+- [ ] **Step 1: CLAUDE.md** — in the `## C++ rewrite programme` section: (a) in the plan-A bullet replace the trailing `Next: plan C (dense kernels).` with `Plan C followed (next bullet).`; (b) in the **Toolchain** bullet change `` `-ffp-contract=off`, no `` to `` `-ffp-contract=off` + `-fno-math-errno` (plan C: rustc's libm intrinsics have no errno), no ``; (c) append this bullet after the plan-A bullet:
 
 ```markdown
 - **Sub-project 1a, plan C landed (`sapient::backends_cpu` dense kernels):** `cpp/libs/sapient-backends-cpu/` ports `kernels/{elementwise,softmax,reduce,layernorm,rope,attention,conv2d}` and the float paths + dtype dispatcher of `kernels/matmul` 1:1 (26 + 5 Rust tests by name; namespaces mirror the Rust module paths, e.g. `kernels::attention::scaled_dot_product_attention`). Three stand-ins are hand-written: **`parallel`** (a persistent pool reproducing rayon's `par_chunks_mut` chunk→range partition — parity depends only on the partition, never on which thread runs a chunk; `num_threads()` follows rayon's `RAYON_NUM_THREADS` rules), **`cpu_features`** (`has_dotprod/has_i8mm/has_avx2_fma`, cached `is_*_feature_detected!` twins) and **`sgemm`** (packed, cache-blocked, 4-wide FMA; max-error gated vs `matrixmultiply`, but bit-independent of the callers' thread-count row blocking so results never vary with `RAYON_NUM_THREADS`). `thermal`/`spinpool` are inert stubs with plan E's signatures; `matmul_nt`'s seven quantized arms return an explicit plan-D error. Bit-identity rules that bit: Rust's float `Sum` seeds at `-0.0` (every ported `.iter().sum()` starts at `-0.0f`); `-fno-math-errno` is a parity flag (rustc lowers libm to LLVM intrinsics; Darwin defaulted to it, Linux did not); libm calls are the `f`-suffixed C names, never double; inside a kernel namespace the module's own `exp/log/abs/…(const Tensor&)` hide the unqualified libm names. **Known oracle defect reproduced on purpose:** Rust's NEON `dot_f32_x_f16_neon` (`matmul_nt` at m=1, k≥64 with F16 weights) mis-decodes negative f16 values (the sign bit leaks into the exponent field, ×2^32) — dormant because F16 linears are online-quantised to Q8_0 at load and Rust's own test uses k=2; ported verbatim, pinned by the `matmul_nt_f16_m1` golden case, recorded in `docs/PARITY.md`. Gate: 43 golden cases — 17 dense ones bit-identical, 4 sgemm-backed within `1e-5·max(1,|ref|)` (`sapient::testing::within_rel_of_max`; `exact_equal<T>` added for plan D). `just cpp-tidy` runs the CI-pinned clang-tidy (CI-only on this Mac: LLVM-18 tidy cannot parse current macOS libc++). Next: plan D (quant kernels).
 ```
+
+- [ ] **Step 1b: spec §3 rule 1** — in `docs/superpowers/specs/2026-09-21-cpp-sp1a-core-io-cpu-design.md`, append to rule 1 of §3: `**As built (plan C):** \`-fno-math-errno\` joined the parity flags — rustc lowers \`sin\`/\`cos\`/\`exp\`/\`pow\`/\`sqrt\` to LLVM intrinsics with no errno, and Clang matches that lowering only under the flag (the Darwin default, not Linux's); this amends programme spec D1's flag list by reference.`
 
 - [ ] **Step 2: `docs/ROADMAP.md`** — Phase 7 table row 1a status → `in progress — plans A (core) and C (dense kernels) implemented on feat/cpp-sp1a; plans D, E, B pending`.
 
@@ -4472,7 +4507,7 @@ Expected, **derived** (report the actual numbers; a mismatch is reported in the 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add CLAUDE.md docs/ROADMAP.md docs/PARITY.md docs/PROJECT_GUIDE.md CHANGELOG.md justfile
+git add CLAUDE.md docs/ROADMAP.md docs/PARITY.md docs/PROJECT_GUIDE.md CHANGELOG.md justfile docs/superpowers/specs/2026-09-21-cpp-sp1a-core-io-cpu-design.md
 git commit -m "docs(sp1a-C): dense kernels landed — CLAUDE.md, roadmap, parity ledger (+ known oracle defect), just cpp-tidy
 
 CONTRIBUTING and README need no change for a library-internal plan.
