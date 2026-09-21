@@ -100,17 +100,31 @@ std::string debug_dims(const std::vector<size_t>& dims);
 #define SAPIENT_CAT_(a, b) a##b
 #define SAPIENT_CAT(a, b) SAPIENT_CAT_(a, b)
 
-/// `expr?` for a Result whose value is discarded (or Result<void>).
-#define SAPIENT_TRY(expr)                                                                          \
+// `__COUNTER__` (unlike `__LINE__`) increments on every textual expansion, including repeats
+// within one macro's own replacement list — so it must be captured into a macro ARGUMENT exactly
+// once (here, by the outer SAPIENT_TRY/SAPIENT_TRY_ASSIGN passing it to the _IMPL macro below) and
+// then referenced via that argument's already-expanded name, never written as `__COUNTER__`
+// itself more than once per invocation.
+#define SAPIENT_TRY_IMPL(var, expr)                                                                \
     do {                                                                                           \
-        auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                                       \
-        if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                                      \
-            return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error()));       \
+        auto&& var = (expr);                                                                       \
+        if (!var.has_value()) return ::tl::unexpected(std::move(var.error()));                     \
     } while (0)
 
+/// `expr?` for a Result whose value is discarded (or Result<void>).
+#define SAPIENT_TRY(expr) SAPIENT_TRY_IMPL(SAPIENT_CAT(sapient_try_, __COUNTER__), expr)
+
+#define SAPIENT_TRY_ASSIGN_IMPL(var, lhs, expr)                                                    \
+    auto&& var = (expr);                                                                           \
+    if (!var.has_value()) return ::tl::unexpected(std::move(var.error()));                         \
+    lhs = std::move(*var)
+
 /// `lhs = expr?;` — `lhs` may be a declaration (`int v`) or an existing lvalue.
+///
+/// Must be used as its own statement inside braces (e.g. the body of a function or a `{ }`
+/// block), never as the unbraced body of `if`/`for`/`while`: it intentionally declares a
+/// temporary (`sapient_try_N`) in the enclosing scope, and an unbraced statement body is its own
+/// scope, so the declaration would not outlive the following `lhs = ...` in the way the macro
+/// relies on (and, depending on the surrounding code, may not even compile).
 #define SAPIENT_TRY_ASSIGN(lhs, expr)                                                              \
-    auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                                           \
-    if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                                          \
-        return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error()));           \
-    lhs = std::move(*SAPIENT_CAT(sapient_try_, __LINE__))
+    SAPIENT_TRY_ASSIGN_IMPL(SAPIENT_CAT(sapient_try_, __COUNTER__), lhs, expr)

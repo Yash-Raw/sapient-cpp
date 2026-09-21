@@ -64,3 +64,28 @@ TEST(Error, try_macro_propagates) {
     ASSERT_FALSE(outer(false).has_value());
     EXPECT_EQ(outer(false).error().to_string(), "Internal error: boom");
 }
+
+TEST(Error, debug_str_escapes_control_characters_like_rust) {
+    EXPECT_EQ(Error::node_not_found(std::string("a\0b", 3)).to_string(),
+              "Node \"a\\0b\" not found in graph");
+    EXPECT_EQ(Error::node_not_found("x\x1by\x7f").to_string(),
+              "Node \"x\\u{1b}y\\u{7f}\" not found in graph");
+    EXPECT_EQ(Error::node_not_found("q\"\\\n\t\r").to_string(),
+              "Node \"q\\\"\\\\\\n\\t\\r\" not found in graph");
+}
+
+TEST(Error, try_macro_discard_form_and_result_void) {
+    auto step = [](bool ok) -> Result<void> {
+        if (!ok) return tl::unexpected(Error::internal("step failed"));
+        return {};
+    };
+    auto run = [&](bool ok) -> Result<int> {
+        SAPIENT_TRY(step(ok));
+        // clang-format off
+        SAPIENT_TRY(step(true)); SAPIENT_TRY(step(true));  // two expansions on one line must compile
+        // clang-format on
+        return 1;
+    };
+    ASSERT_TRUE(run(true).has_value());
+    EXPECT_EQ(run(false).error().to_string(), "Internal error: step failed");
+}

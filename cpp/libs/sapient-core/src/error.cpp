@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 #include "sapient/core/error.hpp"
 
+#include <cstdio>
 #include <sstream>
 
 namespace sapient::core {
@@ -16,7 +17,9 @@ std::string debug_dims(const std::vector<size_t>& dims) {
 }
 
 namespace {
-// Rust `{:?}` on a String: double-quoted with \" \\ \n \t \r escaped.
+// Rust `{:?}` on a String: double-quoted with \" \\ \n \t \r \0 escaped, and every other control
+// byte (< 0x20 or == 0x7F) as `\u{XX}` (lowercase hex, no zero padding) — matches
+// `char::escape_debug`.
 std::string debug_str(const std::string& s) {
     std::string out = "\"";
     for (const char c : s) {
@@ -36,8 +39,17 @@ std::string debug_str(const std::string& s) {
         case '\r':
             out += "\\r";
             break;
+        case '\0':
+            out += "\\0";
+            break;
         default:
-            out += c;
+            if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "\\u{%x}", static_cast<unsigned char>(c));
+                out += buf;
+            } else {
+                out += c;
+            }
         }
     }
     return out + "\"";
