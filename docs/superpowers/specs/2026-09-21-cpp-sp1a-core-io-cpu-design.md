@@ -123,6 +123,11 @@ the same defaults — see the kernels porting map §2.10.
   `Q5_K` matmul, both `SAPIENT_Q8K_ACT` settings; E — the D suite re-run with
   `SAPIENT_SPINPOOL=1` and `=0` (bit-identical); B — none (io is gated by 1b's greedy parity;
   1a gives it synthetic-file tests and an env-gated real-file heap-vs-mmap byte check).
+  **As built (plan D):** "both `SAPIENT_Q8K_ACT` settings" is a second `dump_kernels --q8k-off`
+  pass under `SAPIENT_Q8K_ACT=0` (the knob is read once per process on both sides) whose twelve
+  knob-sensitive cases carry a `_q8k_off` suffix, consumed by a second ctest entry with that
+  environment; the D suite also carries plan C's odd-length carry-over cases
+  (`matmul_nt_f32_m1_k519`, `matmul_nt_f16_m1_k67`, `attention_decode_hd10`).
 - **Hosts.** macOS arm64 locally (NEON/dotprod/i8mm on Apple M-series); x86_64 scalar/AVX2 and
   Windows only via the CI `cpp-parity`/`cpp-build-windows` jobs.
 - **Rust untouched** except `dump_kernels.rs` extensions (each plan lists its additions).
