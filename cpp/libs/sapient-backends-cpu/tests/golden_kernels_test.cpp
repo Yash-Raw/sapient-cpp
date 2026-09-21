@@ -3,7 +3,7 @@
 // Plan C gate: the dense kernels vs the Rust oracle's dumps (SAPIENT_GOLDEN_DIR; unset → SKIP,
 // set-but-missing → FAIL). Bit-identical everywhere except the sgemm-backed cases — matmul_nt_f32_m1
 // (k=64 < 512 takes sgemm in Rust too), matmul_nt_f32_m4, conv2d_s1/s2 — which use the spec §4
-// tolerance 1e-5·max(1, max|ref|). The six matmul_nt_q*_m{1,3} dumps are plan D's.
+// tolerance 1e-5·max(1, max|ref|). The quantized matmul_nt dumps are consumed by golden_quant_test.cpp (plan D).
 #include <gtest/gtest.h>
 
 #include <array>
@@ -264,4 +264,36 @@ TEST(GoldenKernels, conv2d_s1_sgemm_tolerance) {
 }
 TEST(GoldenKernels, conv2d_s2_sgemm_tolerance) {
     check_conv("conv2d_s2");
+}
+
+// ── plan-C carry-over: SIMD body + scalar tail (plan D, M1-a) ────────────────
+
+TEST(GoldenKernels, matmul_nt_f32_m1_k519) { // 16-wide body, one 4-wide step, 3-element tail
+    SAPIENT_GOLDEN_CASE(c, "matmul_nt_f32_m1_k519");
+    auto y = matmul::matmul_nt(tensor_of(c, "in:x"), tensor_of(c, "in:w"));
+    ASSERT_TRUE(y.has_value()) << y.error().to_string();
+    EXPECT_TRUE(bit_identical(y->to_f32_vec(), ref(c)));
+}
+
+TEST(GoldenKernels, matmul_nt_f16_m1_k67) { // NEON bit-surgery body + software-f16 tail in one dot
+    SAPIENT_GOLDEN_CASE(c, "matmul_nt_f16_m1_k67");
+    const auto shape = c.get("param:w_shape").as<uint32_t>();
+    auto w =
+        Tensor::from_f16_bytes(c.get("in:w_f16").as<uint8_t>(), Shape{shape.at(0), shape.at(1)});
+    ASSERT_TRUE(w.has_value()) << w.error().to_string();
+    auto y = matmul::matmul_nt(tensor_of(c, "in:x"), *w);
+    ASSERT_TRUE(y.has_value()) << y.error().to_string();
+    EXPECT_TRUE(bit_identical(y->to_f32_vec(), ref(c)));
+}
+
+TEST(GoldenKernels, attention_decode_hd10) { // dot_f32_neon / saxpby_neon 4-wide body + 2-lane tail
+    SAPIENT_GOLDEN_CASE(c, "attention_decode_hd10");
+    auto y = attention::scaled_dot_product_attention(tensor_of(c, "in:q"),
+                                                     tensor_of(c, "in:k"),
+                                                     tensor_of(c, "in:v"),
+                                                     nullptr,
+                                                     std::nullopt,
+                                                     param<uint32_t>(c, "param:n_kv_heads"));
+    ASSERT_TRUE(y.has_value()) << y.error().to_string();
+    EXPECT_TRUE(bit_identical(y->to_f32_vec(), ref(c)));
 }

@@ -13,6 +13,10 @@ out=$(mkdir -p "${1:?usage: golden_dump.sh <out-dir> [--seed N]}" && cd "$1" && 
 shift
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 (cd "$repo" && cargo run --release -q -p sapient-backends-cpu --example dump_kernels -- --out "$out" "$@")
+# Second pass (spec §4 "both SAPIENT_Q8K_ACT settings"): the knob is read once per process on both
+# sides, so the twelve knob-sensitive matmul_nt cases are regenerated under SAPIENT_Q8K_ACT=0 with
+# a `_q8k_off` suffix (`--q8k-off` keeps every RNG draw and writes only those cases).
+(cd "$repo" && SAPIENT_Q8K_ACT=0 cargo run --release -q -p sapient-backends-cpu --example dump_kernels -- --out "$out" --q8k-off "$@")
 count=$(find "$out" -name '*.sapd' | wc -l | tr -d ' ')
 [ "$count" -gt 0 ] || { echo "golden_dump: no .sapd files were written to $out" >&2; exit 1; }
 echo "golden_dump: $count cases in $out — export SAPIENT_GOLDEN_DIR=$out before running ctest"

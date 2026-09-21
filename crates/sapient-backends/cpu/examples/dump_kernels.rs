@@ -22,8 +22,15 @@
 //! bytes), `layer_norm`, `reduce` (four outputs), `apply_rope_partial(_scaled)`, `attention_masked`,
 //! `gelu`, `softmax_axis0`, `log_softmax`, `conv2d_s{1,2}`.
 //!
+//! Plan D (quantized kernels): `quantize_row_to_i8_blocks`, `i8_block_sums`, `quantize_row_to_q8k`,
+//! `repack_q{4,6}_k_rows4`, `matmul_nt_{q4_0_m{1,3},q5_k_m1,q8_0_m8,q4_k_r4_m{1,2,3,8},q6_k_r4_m{1,2,3,8}}`,
+//! and the plan-C carry-overs `matmul_nt_f32_m1_k519`, `matmul_nt_f16_m1_k67`, `attention_decode_hd10`
+//! (SIMD body + scalar tail). `--q8k-off` (run under `SAPIENT_Q8K_ACT=0`) writes ONLY the twelve
+//! knob-sensitive `matmul_nt_{q4_k,q6_k,q4_k_r4,q6_k_r4}_m*` cases, renamed `*_q8k_off`; every RNG
+//! draw happens exactly as in the default run so the inputs are byte-identical across the two.
+//!
 //! Usage:
-//!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --out <dir> [--seed N]
+//!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --out <dir> [--seed N] [--q8k-off]
 //!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --format-sample <file>
 
 use std::error::Error;
@@ -45,7 +52,8 @@ const DT_U32: u8 = 4;
 const DT_U64: u8 = 5;
 const DEFAULT_SEED: u64 = 0x5A71_E47D_0000_0001;
 
-const USAGE: &str = "usage: dump_kernels --out <dir> [--seed N] | --format-sample <file>";
+const USAGE: &str =
+    "usage: dump_kernels --out <dir> [--seed N] [--q8k-off] | --format-sample <file>";
 
 /// xorshift64* — deterministic, dependency-free (same family as the sampler's RNG).
 struct Rng(u64);
@@ -233,9 +241,13 @@ fn case(name: impl Into<String>, arrays: Vec<Array>) -> Case {
 
 // ── the cases ────────────────────────────────────────────────────────────────────────────────
 
-fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
+fn build_cases(seed: u64, q8k_off: bool) -> Result<Vec<Case>, Box<dyn Error>> {
     let mut rng = Rng::new(seed);
     let mut cases: Vec<Case> = Vec::new();
+    // `--q8k-off`: the twelve SAPIENT_Q8K_ACT-sensitive matmul_nt cases get this suffix and are
+    // the only ones kept (see the end of this function). Every other case is still computed so
+    // the RNG sequence — and therefore every input — is identical to the default run.
+    let q8k_suffix = if q8k_off { "_q8k_off" } else { "" };
 
     // Block quantizers.
     let x32 = rng.f32s(32, -1.0, 1.0);
@@ -335,7 +347,10 @@ fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
             let xt = Tensor::from_f32(&rng.f32s(m * kq_len, -1.0, 1.0), vec![m, kq_len])?;
             let y = matmul::matmul_nt(&xt, &wt)?;
             cases.push(case(
-                format!("matmul_nt_{tag}_m{m}"),
+                format!(
+                    "matmul_nt_{tag}_m{m}{}",
+                    if tag == "q8_0" { "" } else { q8k_suffix }
+                ),
                 vec![
                     Array::tensor("in:x", &xt),
                     Array::u8("in:w_blocks", &[wbytes.len()], &wbytes),
@@ -692,6 +707,189 @@ fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
         cases.push(case("conv2d_s2", conv([0, 0, 0, 0], [2, 2])?));
     }
 
+    // ── plan D: quantized kernels (sub-project 1a) ──────────────────────────────────────────────
+    // Activation quantisers: per-32 int8 blocks (+ the precomputed sums) and the Q8_K per-256
+    // format, with one outlier channel so the per-block scale isolation is exercised. Integer
+    // outputs are compared exactly on the C++ side; scales bit-identically.
+    {
+        let mut xa = rng.f32s(512, -2.0, 2.0);
+        xa[100] = 25.0;
+        let (q, s) = quant::quantize_row_to_i8_blocks(&xa);
+        cases.push(case(
+            "quantize_row_to_i8_blocks",
+            vec![
+                Array::f32("in:x", &[512], &xa),
+                Array::i8("out:q", &[512], &q),
+                Array::f32("out:scales", &[16], &s),
+            ],
+        ));
+        let sums = quant::i8_block_sums(&q);
+        cases.push(case(
+            "i8_block_sums",
+            vec![
+                Array::i8("in:q", &[512], &q),
+                Array::i32("out:sums", &[16], &sums),
+            ],
+        ));
+        let (q, s, sums) = quant::quantize_row_to_q8k(&xa);
+        cases.push(case(
+            "quantize_row_to_q8k",
+            vec![
+                Array::f32("in:x", &[512], &xa),
+                Array::i8("out:q", &[512], &q),
+                Array::f32("out:scales", &[2], &s),
+                Array::i32("out:sums", &[16], &sums),
+            ],
+        ));
+    }
+    // Row-interleaved repacks (u8 exact) — the only producers of R4 bytes — and the matmul_nt
+    // paths plan C stubbed: Q4_0 (m=1 GEMV, m=3), Q5_K (m=1, no SIMD/dotprod path exists), Q8_0
+    // at m=8 (the blocked W8A8 GEMM), and the R4 layouts at m ∈ {1 (decode), 2 (SMMLA pairs),
+    // 3 (pair + odd tail), 8}. The R4 cases feed the Rust-repacked bytes so the matmul gate is
+    // independent of the repack gate.
+    {
+        let (r4_rows, r4_k) = (8usize, 512usize);
+        let q4k_plain = kquant_rows(&mut rng, r4_rows, r4_k, q4_k_block);
+        let q4k_packed = quant::repack_q4_k_rows4(&q4k_plain, r4_rows, r4_k);
+        cases.push(case(
+            "repack_q4_k_rows4",
+            vec![
+                Array::u8("in:blocks", &[q4k_plain.len()], &q4k_plain),
+                Array::u32("param:shape", &[2], &[r4_rows as u32, r4_k as u32]),
+                Array::u8("out:packed", &[q4k_packed.len()], &q4k_packed),
+            ],
+        ));
+        let q6k_plain = kquant_rows(&mut rng, r4_rows, r4_k, q6_k_block);
+        let q6k_packed = quant::repack_q6_k_rows4(&q6k_plain, r4_rows, r4_k);
+        cases.push(case(
+            "repack_q6_k_rows4",
+            vec![
+                Array::u8("in:blocks", &[q6k_plain.len()], &q6k_plain),
+                Array::u32("param:shape", &[2], &[r4_rows as u32, r4_k as u32]),
+                Array::u8("out:packed", &[q6k_packed.len()], &q6k_packed),
+            ],
+        ));
+
+        let mut quant_matmul = |name: String,
+                                wbytes: &[u8],
+                                dtype: DType,
+                                m: usize,
+                                rng: &mut Rng|
+         -> Result<(), Box<dyn Error>> {
+            let wt = Tensor::from_quant_bytes(wbytes, vec![rows, kq_len], dtype)?;
+            let xt = Tensor::from_f32(&rng.f32s(m * kq_len, -1.0, 1.0), vec![m, kq_len])?;
+            let y = matmul::matmul_nt(&xt, &wt)?;
+            cases.push(case(
+                name,
+                vec![
+                    Array::tensor("in:x", &xt),
+                    Array::u8("in:w_blocks", &[wbytes.len()], wbytes),
+                    Array::u32("param:w_shape", &[2], &[rows as u32, kq_len as u32]),
+                    Array::tensor("out:y", &y),
+                ],
+            ));
+            Ok(())
+        };
+        let wq4 = q4_0_row(&rng.f32s(rows * kq_len, -1.0, 1.0));
+        for m in [1usize, 3] {
+            quant_matmul(
+                format!("matmul_nt_q4_0_m{m}"),
+                &wq4,
+                DType::Q4_0,
+                m,
+                &mut rng,
+            )?;
+        }
+        let wq5 = kquant_rows(&mut rng, rows, kq_len, q5_k_block);
+        quant_matmul(
+            "matmul_nt_q5_k_m1".to_string(),
+            &wq5,
+            DType::Q5_K,
+            1,
+            &mut rng,
+        )?;
+        let wq8 = q8_0_row(&rng.f32s(rows * kq_len, -1.0, 1.0));
+        quant_matmul(
+            "matmul_nt_q8_0_m8".to_string(),
+            &wq8,
+            DType::Q8_0,
+            8,
+            &mut rng,
+        )?;
+        for m in [1usize, 2, 3, 8] {
+            quant_matmul(
+                format!("matmul_nt_q4_k_r4_m{m}{q8k_suffix}"),
+                &q4k_packed,
+                DType::Q4_K_R4,
+                m,
+                &mut rng,
+            )?;
+        }
+        for m in [1usize, 2, 3, 8] {
+            quant_matmul(
+                format!("matmul_nt_q6_k_r4_m{m}{q8k_suffix}"),
+                &q6k_packed,
+                DType::Q6_K_R4,
+                m,
+                &mut rng,
+            )?;
+        }
+    }
+    // Plan-C carry-over: the SIMD-body + scalar-tail mixes of the dense dots. k=519 → dot_f32_fast
+    // runs its 16-wide body, one 4-wide step and a 3-element scalar tail; k=67 → dot_f32_x_f16
+    // mixes the NEON bit-surgery body with the software-f16 tail in ONE dot; head_dim=10 →
+    // attention's dot_f32_neon/saxpby_neon take their 4-wide body + 2-lane tails.
+    {
+        let (k, n) = (519usize, 8usize);
+        let wt = Tensor::from_f32(&rng.f32s(n * k, -1.0, 1.0), vec![n, k])?;
+        let xt = Tensor::from_f32(&rng.f32s(k, -1.0, 1.0), vec![1, k])?;
+        let y = matmul::matmul_nt(&xt, &wt)?;
+        cases.push(case(
+            "matmul_nt_f32_m1_k519",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("in:w", &wt),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+        let (k, n) = (67usize, 8usize);
+        let w_src = rng.f32s(n * k, -1.0, 1.0);
+        let w_f16: Vec<u8> = w_src
+            .iter()
+            .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let wt = Tensor::from_f16_bytes(&w_f16, vec![n, k])?;
+        let xt = Tensor::from_f32(&rng.f32s(k, -1.0, 1.0), vec![1, k])?;
+        let y = matmul::matmul_nt(&xt, &wt)?;
+        cases.push(case(
+            "matmul_nt_f16_m1_k67",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::u8("in:w_f16", &[w_f16.len()], &w_f16),
+                Array::u32("param:w_shape", &[2], &[n as u32, k as u32]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+        let hd10 = 10usize;
+        let q = Tensor::from_f32(&rng.f32s(4 * hd10, -1.0, 1.0), vec![1, 4, 1, hd10])?;
+        let k = Tensor::from_f32(&rng.f32s(2 * 5 * hd10, -1.0, 1.0), vec![1, 2, 5, hd10])?;
+        let v = Tensor::from_f32(&rng.f32s(2 * 5 * hd10, -1.0, 1.0), vec![1, 2, 5, hd10])?;
+        let y = attention::scaled_dot_product_attention(&q, &k, &v, None, None, 2)?;
+        cases.push(case(
+            "attention_decode_hd10",
+            vec![
+                Array::tensor("in:q", &q),
+                Array::tensor("in:k", &k),
+                Array::tensor("in:v", &v),
+                Array::u32("param:n_kv_heads", &[1], &[2]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    if q8k_off {
+        cases.retain(|(name, _)| name.ends_with("_q8k_off"));
+    }
+
     Ok(cases)
 }
 
@@ -724,6 +922,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut out: Option<PathBuf> = None;
     let mut sample: Option<PathBuf> = None;
     let mut seed = DEFAULT_SEED;
+    let mut q8k_off = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -738,6 +937,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--seed" => {
                 seed = take(&args, i, "--seed").parse()?;
                 i += 2;
+            }
+            "--q8k-off" => {
+                q8k_off = true;
+                i += 1;
             }
             other => {
                 eprintln!("unknown argument: {other}\n{USAGE}");
@@ -760,7 +963,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(dir) = out {
         fs::create_dir_all(&dir)?;
-        let cases = build_cases(seed)?;
+        let cases = build_cases(seed, q8k_off)?;
         for (name, arrays) in &cases {
             let path = dir.join(format!("{name}.sapd"));
             fs::write(&path, encode_case(name, arrays))?;
