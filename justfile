@@ -98,9 +98,15 @@ cpp-build preset="dev":
 cpp-test preset="dev":
     cd cpp && ctest --preset {{preset}}
 
-# Format the C++ sources in place
+# Format the C++ sources in place (resolves clang-format: $SAPIENT_CLANG_FORMAT -> .superpowers/tools-venv/bin/clang-format -> clang-format-18 -> clang-format)
 cpp-fmt:
-    git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs clang-format -i
+    CF="${SAPIENT_CLANG_FORMAT:-}"; \
+    if [ -z "$CF" ] && [ -x ".superpowers/tools-venv/bin/clang-format" ]; then CF=".superpowers/tools-venv/bin/clang-format"; fi; \
+    if [ -z "$CF" ] && command -v clang-format-18 >/dev/null 2>&1; then CF="clang-format-18"; fi; \
+    if [ -z "$CF" ] && command -v clang-format >/dev/null 2>&1; then CF="clang-format"; fi; \
+    if [ -z "$CF" ]; then echo "cpp-fmt: no clang-format found (checked \$SAPIENT_CLANG_FORMAT, .superpowers/tools-venv/bin/clang-format, clang-format-18, clang-format on PATH)" >&2; exit 1; fi; \
+    case "$("$CF" --version)" in *" 18."*) ;; *) echo "cpp-fmt: warning — $CF reports $("$CF" --version | head -1); CI pins clang-format 18" >&2 ;; esac; \
+    git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs "$CF" -i
 
 # Lint gates that need no build: SPDX headers (both trees) + WGSL shader sync
 cpp-lint:

@@ -48,7 +48,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(flags)     # Clang gate + -ffp-contract=off (global)
+include(flags)     # Clang gate (global) + sapient_apply_parity_flags_here() used by libs/
 include(warnings)  # sapient_apply_warnings(<target>)
 include(deps)      # FetchContent pins
 

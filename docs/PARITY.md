@@ -28,11 +28,15 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
   exercised only on the Linux/Windows CI hosts — this repo's dev/test host is arm64, where the
   `#if defined(__x86_64__) || defined(_M_X64)` block compiles out entirely.
 - (c) The `sapient::testing` golden reader has no `expect_bit_identical`/`max_abs_err`/f16-tag
-  helpers yet.
+  helpers yet. — **closed by plan A (`compare.hpp`)**: `sapient::testing::{bit_identical,
+  max_abs_err, within_abs, SAPIENT_GOLDEN_CASE}`.
 
 ### Results
 
-_(no rows yet)_
+| Date | Gate | Host / ISA path | Rust commit | C++ commit | Result |
+|---|---|---|---|---|---|
+| 2026-09-21 | 22 sapient-core unit tests ported by name (+ f16 exhaustive round trip, dequant unit tests) | macOS arm64 (Apple M5) | `8fdf25f` | `adbf167` | pass |
+| 2026-09-21 | `dequant_{q4_0,q8_0,q4_k,q5_k,q6_k,q4_k_r4,q6_k_r4}` (4×512) + `dequant_{f16,bf16}` (64) vs Rust `Tensor::to_f32_vec` / `half` narrowing | macOS arm64 | `8fdf25f` | `adbf167` | bit-identical, 9/9 |
 
 ## Sub-project 1b — CPU chat vertical slice
 

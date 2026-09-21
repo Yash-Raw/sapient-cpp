@@ -11,6 +11,9 @@ section below as the GitHub release body.
 - Rust tree: two behaviour-identical clippy-1.98 lint fixes (scheduler `mem::take`; targeted `result_large_err` allow in the CLI server) so the workspace clippy gate stays green on current stable.
 - No user-facing behaviour change; the Rust binaries are unaffected.
 
+### 🧱 C++ rewrite — sub-project 1a, plan A (sapient::core)
+- `cpp/libs/sapient-core`: Tensor/DType/Shape/Buffer/Error ported 1:1 with all 22 Rust tests, software f16/bf16, the shared dequantiser, tl::expected-based Result; 9 golden dequant cases bit-identical to the Rust oracle.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**

@@ -35,12 +35,28 @@ if ! cargo clippy --workspace --all-targets -- -D warnings; then
   exit 1
 fi
 
-# C++ tree: clang-format dry run (only when clang-format is installed).
+# C++ tree: clang-format dry run (only when a clang-format binary resolves).
+# Resolution order: $SAPIENT_CLANG_FORMAT -> .superpowers/tools-venv/bin/clang-format
+# (pinned to CI's 18.x) -> clang-format-18 -> clang-format on PATH.
 if [ -d cpp ]; then
-  if command -v clang-format >/dev/null 2>&1; then
-    echo "pre-push: clang-format --dry-run over cpp/…"
+  CF="${SAPIENT_CLANG_FORMAT:-}"
+  if [ -z "$CF" ] && [ -x ".superpowers/tools-venv/bin/clang-format" ]; then
+    CF=".superpowers/tools-venv/bin/clang-format"
+  fi
+  if [ -z "$CF" ] && command -v clang-format-18 >/dev/null 2>&1; then
+    CF="clang-format-18"
+  fi
+  if [ -z "$CF" ] && command -v clang-format >/dev/null 2>&1; then
+    CF="clang-format"
+  fi
+  if [ -n "$CF" ]; then
+    case "$("$CF" --version)" in
+      *" 18."*) ;;
+      *) echo "pre-push: warning — $CF reports $("$CF" --version | head -1); CI pins clang-format 18" >&2 ;;
+    esac
+    echo "pre-push: clang-format --dry-run over cpp/ ($CF)…"
     cpp_files=$(git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm')
-    if [ -n "$cpp_files" ] && ! echo "$cpp_files" | xargs clang-format --dry-run --Werror; then
+    if [ -n "$cpp_files" ] && ! echo "$cpp_files" | xargs "$CF" --dry-run --Werror; then
       echo "" >&2
       echo "pre-push: clang-format violations in cpp/ — run 'just cpp-fmt', commit, then push again." >&2
       exit 1
