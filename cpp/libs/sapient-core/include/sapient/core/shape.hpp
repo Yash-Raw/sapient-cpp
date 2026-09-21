@@ -31,13 +31,13 @@ struct Shape {
     /// NumPy right-aligned broadcasting.
     Result<Shape> broadcast_with(const Shape& other) const;
     Result<Shape> expand_dims(size_t axis) const;
-    Shape squeeze() const;  // drops every dim equal to 1
+    Shape squeeze() const; // drops every dim equal to 1
     /// Rejects zero dims (error text uses the InvalidGraph variant, as Rust does).
     Result<void> validate() const;
     /// Element (not byte) offset of a multi-index.
     Result<size_t> flat_index(std::span<const size_t> idx) const;
-    std::string to_string() const;  // "[2, 3]"
+    std::string to_string() const; // "[2, 3]"
     bool operator==(const Shape&) const = default;
 };
 
-}  // namespace sapient::core
+} // namespace sapient::core

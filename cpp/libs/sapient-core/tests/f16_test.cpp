@@ -29,10 +29,10 @@ TEST(F16, narrowing_rounds_to_nearest_even) {
     EXPECT_EQ(f32_to_f16_bits(1.0f), 0x3C00);
     EXPECT_EQ(f32_to_f16_bits(-2.0f), 0xC000);
     EXPECT_EQ(f32_to_f16_bits(65504.0f), 0x7BFF);
-    EXPECT_EQ(f32_to_f16_bits(65520.0f), 0x7C00);                // tie at the top rounds to inf
-    EXPECT_EQ(f32_to_f16_bits(1.0009765625f), 0x3C01);           // 1 + 2^-10 exact
-    EXPECT_EQ(f32_to_f16_bits(1.00048828125f), 0x3C00);          // 1 + 2^-11: tie → even (0x3C00)
-    EXPECT_EQ(f32_to_f16_bits(1.00146484375f), 0x3C02);          // 1 + 3·2^-11: tie → even (0x3C02)
+    EXPECT_EQ(f32_to_f16_bits(65520.0f), 0x7C00);       // tie at the top rounds to inf
+    EXPECT_EQ(f32_to_f16_bits(1.0009765625f), 0x3C01);  // 1 + 2^-10 exact
+    EXPECT_EQ(f32_to_f16_bits(1.00048828125f), 0x3C00); // 1 + 2^-11: tie → even (0x3C00)
+    EXPECT_EQ(f32_to_f16_bits(1.00146484375f), 0x3C02); // 1 + 3·2^-11: tie → even (0x3C02)
     EXPECT_EQ(f32_to_f16_bits(5.960464477539063e-08f), 0x0001);  // 2^-24
     EXPECT_EQ(f32_to_f16_bits(2.9802322387695312e-08f), 0x0000); // 2^-25: tie → even (0)
     EXPECT_EQ(f32_to_f16_bits(4.470348358154297e-08f), 0x0001);  // 3·2^-26 > half → 1

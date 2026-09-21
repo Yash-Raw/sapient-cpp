@@ -38,7 +38,8 @@ TEST(Shape, reshape) {
     auto r = Shape({2, 3}).reshape({6});
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->dims, (std::vector<size_t>{6}));
-    EXPECT_EQ(Shape({2, 3}).reshape({5}).error().to_string(), "Shape mismatch: expected [2, 3], got [5]");
+    EXPECT_EQ(Shape({2, 3}).reshape({5}).error().to_string(),
+              "Shape mismatch: expected [2, 3], got [5]");
 }
 // Rust: flat_index
 TEST(Shape, flat_index) {
@@ -50,7 +51,8 @@ TEST(Shape, flat_index) {
     EXPECT_EQ(Shape({2, 3, 4}).flat_index(bad).error().to_string(),
               "Internal error: Index 3 out of bounds for dim 1 (size 3)");
     const size_t short_idx[] = {1};
-    EXPECT_EQ(Shape({2, 3}).flat_index(short_idx).error().to_string(), "Rank mismatch: expected 2, got 1");
+    EXPECT_EQ(Shape({2, 3}).flat_index(short_idx).error().to_string(),
+              "Rank mismatch: expected 2, got 1");
 }
 TEST(Shape, validate_expand_squeeze_display) {
     EXPECT_TRUE(Shape({2, 3}).validate().has_value());
