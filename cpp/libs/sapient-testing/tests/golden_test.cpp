@@ -256,3 +256,30 @@ TEST(Compare, golden_case_macro_skips_without_env) {
     EXPECT_FALSE(sapient::testing::load_golden_case("does_not_matter", &why).has_value());
     EXPECT_NE(why.find("SAPIENT_GOLDEN_DIR"), std::string::npos);
 }
+
+TEST(Compare, within_rel_of_max_scales_tolerance_by_reference_magnitude) {
+    using sapient::testing::within_rel_of_max;
+    const float ref[] = {100.0f, -200.0f, 0.5f};
+    const float got[] = {
+        100.001f, -200.001f, 0.5005f}; // abs err 1e-3; max|ref| = 200 → tol 2e-3 at 1e-5
+    EXPECT_TRUE(within_rel_of_max(got, ref, 1e-5f));
+    EXPECT_FALSE(within_rel_of_max(got, ref, 1e-7f));
+    const float small_ref[] = {0.001f};
+    const float small_got[] = {0.001f + 5e-6f}; // the max(1, ·) floor: tol = rel · 1
+    EXPECT_TRUE(within_rel_of_max(small_got, small_ref, 1e-5f));
+    EXPECT_FALSE(within_rel_of_max(small_got, small_ref, 1e-6f));
+}
+
+TEST(Compare, exact_equal_reports_first_mismatch) {
+    using sapient::testing::exact_equal;
+    const int8_t a[] = {-128, 0, 127};
+    const int8_t b[] = {-128, 1, 127};
+    EXPECT_TRUE(exact_equal<int8_t>(a, a));
+    const auto r = exact_equal<int8_t>(a, b);
+    EXPECT_FALSE(r);
+    EXPECT_NE(std::string(r.message()).find("index 1: got 0, ref 1"), std::string::npos)
+        << r.message();
+    const uint32_t c[] = {1, 2};
+    const uint32_t d[] = {1};
+    EXPECT_FALSE(exact_equal<uint32_t>(c, d));
+}

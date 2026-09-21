@@ -18,6 +18,10 @@
 //! `attention_{prefill,decode}`; sapient-core dequant: `dequant_*` (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K,
 //! the Q4_K_R4/Q6_K_R4 row-interleaved layouts, and F16/BF16 widening+narrowing).
 //!
+//! Plan C (dense kernels): `matmul_nt_{f16_m1,f32_m1_k512}` (the two GEMV paths; F16 weights as raw
+//! bytes), `layer_norm`, `reduce` (four outputs), `apply_rope_partial(_scaled)`, `attention_masked`,
+//! `gelu`, `softmax_axis0`, `log_softmax`, `conv2d_s{1,2}`.
+//!
 //! Usage:
 //!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --out <dir> [--seed N]
 //!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --format-sample <file>
@@ -28,7 +32,7 @@ use std::path::PathBuf;
 
 use half::f16;
 use sapient_backends_cpu::kernels::{
-    attention, elementwise, layernorm, matmul, quant, rope, softmax,
+    attention, conv2d, elementwise, layernorm, matmul, quant, reduce, rope, softmax,
 };
 use sapient_core::{DType, Tensor};
 
@@ -509,6 +513,184 @@ fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
             Array::f32("out:f32", &[64], &t.to_f32_vec()),
         ],
     ));
+
+    // ── plan C: dense kernels (sub-project 1a) ──────────────────────────────────────────────────
+    // matmul_nt float GEMV paths. F16 weights are dumped as RAW bytes (`in:w_f16`): the aarch64
+    // path widens f16 by NEON bit-surgery that differs from `half` for non-normal AND negative
+    // values, and the C++ port must reproduce that, so the dump feeds real (signed) bits.
+    // m=1, k>=64 (F16) → dot_f32_x_f16; m=1, k>=512 (F32) → dot_f32_fast.
+    {
+        let (k, n) = (64usize, 8usize);
+        let w_src = rng.f32s(n * k, -1.0, 1.0);
+        let w_f16: Vec<u8> = w_src
+            .iter()
+            .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let wt = Tensor::from_f16_bytes(&w_f16, vec![n, k])?;
+        let xt = Tensor::from_f32(&rng.f32s(k, -1.0, 1.0), vec![1, k])?;
+        let y = matmul::matmul_nt(&xt, &wt)?;
+        cases.push(case(
+            "matmul_nt_f16_m1",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::u8("in:w_f16", &[w_f16.len()], &w_f16),
+                Array::u32("param:w_shape", &[2], &[n as u32, k as u32]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+        let (k, n) = (512usize, 8usize);
+        let wt = Tensor::from_f32(&rng.f32s(n * k, -1.0, 1.0), vec![n, k])?;
+        let xt = Tensor::from_f32(&rng.f32s(k, -1.0, 1.0), vec![1, k])?;
+        let y = matmul::matmul_nt(&xt, &wt)?;
+        cases.push(case(
+            "matmul_nt_f32_m1_k512",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("in:w", &wt),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    // layer_norm over the last axis with weight and bias.
+    {
+        let xt = Tensor::from_f32(&rng.f32s(3 * 32, -2.0, 2.0), vec![3, 32])?;
+        let wt = Tensor::from_f32(&rng.f32s(32, 0.5, 1.5), vec![32])?;
+        let bt = Tensor::from_f32(&rng.f32s(32, -0.5, 0.5), vec![32])?;
+        let y = layernorm::layer_norm(&xt, Some(&wt), Some(&bt), -1, 1e-5)?;
+        cases.push(case(
+            "layer_norm",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("in:weight", &wt),
+                Array::tensor("in:bias", &bt),
+                Array::f32("param:eps", &[1], &[1e-5]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    // reduce_{sum,mean,max,min} over a [2, 3, 4] tensor — one case, four outputs (mean over all
+    // axes is a scalar: dims = []).
+    {
+        let xt = Tensor::from_f32(&rng.f32s(2 * 3 * 4, -3.0, 3.0), vec![2, 3, 4])?;
+        cases.push(case(
+            "reduce",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("out:sum_axis1", &reduce::reduce_sum(&xt, &[1], false)?),
+                Array::tensor("out:mean_all", &reduce::reduce_mean(&xt, &[], false)?),
+                Array::tensor("out:max_axis0_keep", &reduce::reduce_max(&xt, &[0], true)?),
+                Array::tensor("out:min_axis_neg1", &reduce::reduce_min(&xt, &[-1], false)?),
+            ],
+        ));
+    }
+    // Partial RoPE (Phi: rotary_dim < head_dim) and scaled partial RoPE (Gemma3: pos_scale 8).
+    {
+        let xt = Tensor::from_f32(&rng.f32s(2 * 3 * 16, -1.0, 1.0), vec![1, 2, 3, 16])?;
+        let positions: Vec<usize> = vec![7, 8, 9];
+        let pos_u64: Vec<u64> = positions.iter().map(|&p| p as u64).collect();
+        let y = rope::apply_rope_partial(&xt, &positions, 10_000.0, 8)?;
+        cases.push(case(
+            "apply_rope_partial",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::u64("param:positions", &[3], &pos_u64),
+                Array::f32("param:base", &[1], &[10_000.0]),
+                Array::u32("param:rotary_dim", &[1], &[8]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+        let y = rope::apply_rope_partial_scaled(&xt, &positions, 1_000_000.0, 16, 8.0)?;
+        cases.push(case(
+            "apply_rope_partial_scaled",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::u64("param:positions", &[3], &pos_u64),
+                Array::f32("param:base", &[1], &[1_000_000.0]),
+                Array::u32("param:rotary_dim", &[1], &[16]),
+                Array::f32("param:pos_scale", &[1], &[8.0]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    // Attention with an explicit additive mask (sliding window of 3, seq_q=2 over seq_k=6, GQA
+    // 4/2, explicit scale) — exercises the mask branch, the -inf skip and the explicit scale.
+    {
+        let (seq_q, seq_k) = (2usize, 6usize);
+        let q = Tensor::from_f32(&rng.f32s(4 * seq_q * hd, -1.0, 1.0), vec![1, 4, seq_q, hd])?;
+        let k = Tensor::from_f32(&rng.f32s(2 * seq_k * hd, -1.0, 1.0), vec![1, 2, seq_k, hd])?;
+        let v = Tensor::from_f32(&rng.f32s(2 * seq_k * hd, -1.0, 1.0), vec![1, 2, seq_k, hd])?;
+        let mut m = vec![0.0f32; seq_q * seq_k];
+        for qi in 0..seq_q {
+            let pos = qi + (seq_k - seq_q);
+            for ki in 0..seq_k {
+                if ki > pos || ki + 3 <= pos {
+                    m[qi * seq_k + ki] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = Tensor::from_f32(&m, vec![seq_q, seq_k])?;
+        let y = attention::scaled_dot_product_attention(&q, &k, &v, Some(&mask), Some(0.125), 2)?;
+        cases.push(case(
+            "attention_masked",
+            vec![
+                Array::tensor("in:q", &q),
+                Array::tensor("in:k", &k),
+                Array::tensor("in:v", &v),
+                Array::tensor("in:mask", &mask),
+                Array::f32("param:scale", &[1], &[0.125]),
+                Array::u32("param:n_kv_heads", &[1], &[2]),
+                Array::tensor("out:y", &y),
+            ],
+        ));
+    }
+    // gelu (tanh approximation), softmax over axis 0, log_softmax over the last axis.
+    {
+        let xt = Tensor::from_f32(&rng.f32s(64, -6.0, 6.0), vec![64])?;
+        cases.push(case(
+            "gelu",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("out:y", &elementwise::gelu(&xt)?),
+            ],
+        ));
+        let xt = Tensor::from_f32(&rng.f32s(3 * 5, -4.0, 4.0), vec![3, 5])?;
+        cases.push(case(
+            "softmax_axis0",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::i32("param:axis", &[1], &[0]),
+                Array::tensor("out:y", &softmax::softmax(&xt, 0)?),
+            ],
+        ));
+        cases.push(case(
+            "log_softmax",
+            vec![
+                Array::tensor("in:x", &xt),
+                Array::i32("param:axis", &[1], &[-1]),
+                Array::tensor("out:y", &softmax::log_softmax(&xt, -1)?),
+            ],
+        ));
+    }
+    // conv2d (im2col + sgemm → max-error gated): stride 1 with padding, stride 2 without;
+    // groups 1, bias.
+    {
+        let xt = Tensor::from_f32(&rng.f32s(3 * 7 * 7, -1.0, 1.0), vec![1, 3, 7, 7])?;
+        let wt = Tensor::from_f32(&rng.f32s(4 * 3 * 3 * 3, -1.0, 1.0), vec![4, 3, 3, 3])?;
+        let bt = Tensor::from_f32(&rng.f32s(4, -0.5, 0.5), vec![4])?;
+        let conv = |pads: [usize; 4], strides: [usize; 2]| -> Result<Vec<Array>, Box<dyn Error>> {
+            let y = conv2d::conv2d(&xt, &wt, Some(&bt), [3, 3], pads, strides, [1, 1], 1)?;
+            Ok(vec![
+                Array::tensor("in:x", &xt),
+                Array::tensor("in:w", &wt),
+                Array::tensor("in:bias", &bt),
+                Array::u32("param:pads", &[4], &pads.map(|p| p as u32)),
+                Array::u32("param:strides", &[2], &strides.map(|s| s as u32)),
+                Array::tensor("out:y", &y),
+            ])
+        };
+        cases.push(case("conv2d_s1", conv([1, 1, 1, 1], [1, 1])?));
+        cases.push(case("conv2d_s2", conv([0, 0, 0, 0], [2, 2])?));
+    }
 
     Ok(cases)
 }

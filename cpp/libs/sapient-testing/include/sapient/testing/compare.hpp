@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "sapient/testing/golden.hpp"
 
@@ -36,6 +37,33 @@ float max_abs_err(std::span<const float> got, std::span<const float> ref);
 /// opaque.
 ::testing::AssertionResult
 within_abs(std::span<const float> got, std::span<const float> ref, float tol);
+
+/// Spec §4 tolerance for the sgemm-backed cases: `max_abs_err(got, ref) <= rel * max(1, max|ref|)`
+/// (non-finite reference values are ignored when taking the max). Same length rule and NaN
+/// reporting as `within_abs`.
+::testing::AssertionResult
+within_rel_of_max(std::span<const float> got, std::span<const float> ref, float rel);
+
+/// Exact element equality for integer golden arrays (i8/i32/u8/u32/u64 — plan D's activation
+/// quantisers); reports the first mismatching index and both values.
+template <class T>
+::testing::AssertionResult exact_equal(std::span<const T> got, std::span<const T> ref) {
+    if (got.size() != ref.size())
+        return ::testing::AssertionFailure() << "length " << got.size() << " != " << ref.size();
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] == ref[i]) continue;
+        auto failure = ::testing::AssertionFailure() << "index " << i << ": got ";
+        // Widen explicitly so int8/uint8 print as numbers; no `+x` promotion (tidy's
+        // bugprone-signed-char-misuse fires on the signed-char → int case).
+        if constexpr (std::is_signed_v<T>)
+            failure << static_cast<long long>(got[i]) << ", ref " << static_cast<long long>(ref[i]);
+        else
+            failure << static_cast<unsigned long long>(got[i]) << ", ref "
+                    << static_cast<unsigned long long>(ref[i]);
+        return failure;
+    }
+    return ::testing::AssertionSuccess();
+}
 
 } // namespace sapient::testing
 
@@ -67,6 +95,8 @@ within_abs(std::span<const float> got, std::span<const float> ref, float tol);
     }                                                                                              \
     const ::sapient::testing::GoldenCase& var = *opt_var
 
+// `__COUNTER__` is expanded twice per invocation — once per generated identifier — and each
+// expansion yields a fresh value, which is exactly what keeps the two names distinct.
 #define SAPIENT_GOLDEN_CASE(var, name)                                                             \
     SAPIENT_GOLDEN_CASE_IMPL(var,                                                                  \
                              SAPIENT_TESTING_CAT(sapient_golden_why_, __COUNTER__),                \

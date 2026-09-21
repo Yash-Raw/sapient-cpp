@@ -99,4 +99,12 @@ within_abs(std::span<const float> got, std::span<const float> ref, float tol) {
     return ::testing::AssertionFailure() << "max abs err " << m << " > " << tol;
 }
 
+::testing::AssertionResult
+within_rel_of_max(std::span<const float> got, std::span<const float> ref, float rel) {
+    float max_ref = 1.0f;
+    for (const float r : ref)
+        if (std::isfinite(r) && std::fabs(r) > max_ref) max_ref = std::fabs(r);
+    return within_abs(got, ref, rel * max_ref);
+}
+
 } // namespace sapient::testing
