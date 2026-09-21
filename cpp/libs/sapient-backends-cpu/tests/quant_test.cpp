@@ -23,8 +23,12 @@
 #include "sapient/core/f16.hpp"
 
 using namespace sapient::backends_cpu::kernels::quant;
+#if defined(__aarch64__) || defined(_M_ARM64)
+// has_dotprod() is only called from aarch64-only tests below; CI's clang-tidy host is x86_64,
+// where an unguarded using-declaration would be unused (misc-unused-using-decls). has_i8mm() has
+// no Task 1 caller at all — Task 3 adds its own using-declaration when it first calls it.
 using sapient::backends_cpu::cpu_features::has_dotprod;
-using sapient::backends_cpu::cpu_features::has_i8mm;
+#endif
 
 namespace {
 
