@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "sapient/backends_cpu/parallel.hpp"
@@ -90,4 +91,12 @@ TEST(ParallelDeath, par_chunks_mut_zero_chunk_panics) {
     GTEST_FLAG_SET(death_test_style, "threadsafe"); // pool threads may already exist
     std::vector<float> out(4, 0.0f);
     EXPECT_DEATH(par_chunks_mut(out, 0, [](size_t, std::span<float>) {}), "chunk");
+}
+
+// A callback that throws must not unwind through the pool (Job would be destroyed while a
+// worker/queue still references it) — it aborts instead, like a rayon closure panic under
+// panic=abort.
+TEST(ParallelDeath, throwing_callback_aborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe"); // pool threads may already exist
+    EXPECT_DEATH(par_for(4, [](size_t) { throw std::runtime_error("boom"); }), "callback threw");
 }

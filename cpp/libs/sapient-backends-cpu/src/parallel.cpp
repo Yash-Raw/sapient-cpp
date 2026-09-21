@@ -38,6 +38,22 @@ struct Job {
     size_t done{0}; // guarded by Pool::mu_
 };
 
+// Callbacks must not throw. An exception escaping `f` would unwind out of Pool::run/worker
+// without reaching erase_locked/finish/done_cv_.wait — the stack-allocated Job would be destroyed
+// while queue_ (or a worker mid-claim) still holds a pointer to it (use-after-free), and on a
+// worker thread it would call std::terminate anyway (a detached thread has no one to catch it).
+// So every callback invocation is wrapped here and a throw aborts cleanly instead, mirroring the
+// Rust behaviour: a panic inside a rayon closure under this workspace's `panic = "abort"` kills
+// the process too — nothing unwinds through the pool there either.
+void invoke(const std::function<void(size_t)>& f, size_t i) {
+    try {
+        f(i);
+    } catch (...) {
+        sapient::core::panic("parallel: a callback threw an exception (callbacks must not throw; "
+                             "a Rust panic under panic=abort aborts here too)");
+    }
+}
+
 // A job queue with the caller always participating in its own job: progress never depends on a
 // worker being free, so nested par_for (a chunk that itself calls par_for) cannot deadlock —
 // every waiting thread only waits on chunks that some running thread has already claimed.
@@ -53,7 +69,7 @@ public:
     void run(Job& job) {
         if (workers_ == 0) {
             for (size_t i = 0; i < job.n; ++i)
-                (*job.f)(i);
+                invoke(*job.f, i);
             return;
         }
         {
@@ -71,7 +87,7 @@ public:
                 }
                 i = job.next++;
             }
-            (*job.f)(i);
+            invoke(*job.f, i);
             finish(job);
         }
         std::unique_lock<std::mutex> lk(mu_);
@@ -98,7 +114,7 @@ private:
                 }
                 i = job->next++;
             }
-            (*job->f)(i);
+            invoke(*job->f, i);
             finish(*job);
         }
     }

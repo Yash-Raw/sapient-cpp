@@ -19,11 +19,14 @@ size_t num_threads();
 
 /// Calls `f(i)` for every `i` in `[0, n)` exactly once, on the calling thread and the pool's
 /// workers, and returns when all have completed. Re-entrant: `f` may itself call `par_for`.
+/// `f` must not throw — an exception escaping it aborts the process (sapient::core::panic),
+/// mirroring a rayon closure panic under panic=abort.
 void par_for(size_t n, const std::function<void(size_t)>& f);
 
 /// rayon `out.par_chunks_mut(chunk).enumerate().for_each(|(ci, cs)| f(ci, cs))`: chunk `ci` is
 /// `out[ci*chunk, min((ci+1)*chunk, out.size()))`. An empty `out` makes no calls. `chunk == 0`
-/// panics (rayon: "chunk size must not be zero").
+/// panics (rayon: "chunk size must not be zero"). `f` must not throw — an exception escaping it
+/// aborts the process (sapient::core::panic), mirroring a rayon closure panic under panic=abort.
 void par_chunks_mut(std::span<float> out,
                     size_t chunk,
                     const std::function<void(size_t, std::span<float>)>& f);
