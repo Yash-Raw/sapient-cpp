@@ -75,7 +75,10 @@ the same defaults — see the kernels porting map §2.10.
 
 1. Build flags per programme spec D1 (Clang, `-ffp-contract=off`, no fast-math). Rust uses no
    `mul_add`; every fused multiply-add in C++ is an explicit intrinsic where Rust had one, plain
-   `a*b + c` where Rust had none.
+   `a*b + c` where Rust had none. **As built (plan C):** `-fno-math-errno` joined the parity flags
+   — rustc lowers `sin`/`cos`/`exp`/`pow`/`sqrt` to LLVM intrinsics with no errno, and Clang
+   matches that lowering only under the flag (the Darwin default, not Linux's); this amends
+   programme spec D1's flag list by reference.
 2. Mirror each function's ISA variant and its dispatch condition; never "upgrade" a scalar path
    to SIMD or vice versa. x86_64 K-quant kernels stay scalar; AVX2 exists only for
    `dot_q8_0_row_avx2` and `dot_f32_avx2`.

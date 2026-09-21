@@ -108,6 +108,20 @@ cpp-fmt:
     case "$("$CF" --version)" in *" 18."*) ;; *) echo "cpp-fmt: warning — $CF reports $("$CF" --version | head -1); CI pins clang-format 18" >&2 ;; esac; \
     git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs "$CF" -i
 
+# clang-tidy over the C++ sources with the CI-pinned checks (.clang-tidy, WarningsAsErrors: '*').
+# Needs a configured build dir for compile_commands.json (`just cpp-configure`). Resolves the binary
+# like cpp-fmt: $SAPIENT_CLANG_TIDY -> .superpowers/tools-venv/bin/clang-tidy -> clang-tidy-18 -> clang-tidy.
+# NOTE: LLVM-18 clang-tidy cannot parse current macOS libc++ headers — on a Mac this gate is CI-only.
+cpp-tidy preset="dev":
+    CT="${SAPIENT_CLANG_TIDY:-}"; \
+    if [ -z "$CT" ] && [ -x ".superpowers/tools-venv/bin/clang-tidy" ]; then CT=".superpowers/tools-venv/bin/clang-tidy"; fi; \
+    if [ -z "$CT" ] && command -v clang-tidy-18 >/dev/null 2>&1; then CT="clang-tidy-18"; fi; \
+    if [ -z "$CT" ] && command -v clang-tidy >/dev/null 2>&1; then CT="clang-tidy"; fi; \
+    if [ -z "$CT" ]; then echo "cpp-tidy: no clang-tidy found (checked \$SAPIENT_CLANG_TIDY, .superpowers/tools-venv/bin/clang-tidy, clang-tidy-18, clang-tidy on PATH)" >&2; exit 1; fi; \
+    [ -f "cpp/build/{{preset}}/compile_commands.json" ] || { echo "cpp-tidy: cpp/build/{{preset}}/compile_commands.json missing — run: just cpp-configure {{preset}}" >&2; exit 1; }; \
+    case "$("$CT" --version)" in *" 18."*) ;; *) echo "cpp-tidy: warning — $CT reports $("$CT" --version | head -1); CI pins clang-tidy 18" >&2 ;; esac; \
+    git ls-files -- 'cpp/libs/*.cpp' | xargs "$CT" -p cpp/build/{{preset}} -quiet
+
 # Lint gates that need no build: SPDX headers (both trees) + WGSL shader sync
 cpp-lint:
     python3 cpp/scripts/check_spdx.py cpp crates

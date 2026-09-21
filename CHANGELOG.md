@@ -14,6 +14,10 @@ section below as the GitHub release body.
 ### 🧱 C++ rewrite — sub-project 1a, plan A (sapient::core)
 - `cpp/libs/sapient-core`: Tensor/DType/Shape/Buffer/Error ported 1:1 with all 22 Rust tests, software f16/bf16, the shared dequantiser, tl::expected-based Result; 9 golden dequant cases bit-identical to the Rust oracle.
 
+### 🧱 C++ rewrite — sub-project 1a, plan C (sapient::backends_cpu dense kernels)
+- `cpp/libs/sapient-backends-cpu`: attention, RoPE, LayerNorm/RMSNorm, softmax, reductions, element-wise ops, conv2d and the float matmul paths ported 1:1 with all 31 Rust tests; rayon stand-in (`parallel`), ISA probes, own SGEMM; `-fno-math-errno` joins the parity flags; 12 new golden cases (43 total) — 17 dense cases bit-identical, 4 SGEMM-backed within tolerance.
+- Test-only Rust: `dump_kernels` gains the 12 dense cases. No product behaviour change. Recorded in `docs/PARITY.md`: a dormant defect in the Rust NEON F16 GEMV (negative f16 weights mis-decoded ×2^32), which the port reproduces on purpose.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**
