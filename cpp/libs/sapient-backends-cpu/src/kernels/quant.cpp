@@ -844,6 +844,511 @@ dot_q4_k_4rows_r4_neon(std::span<const uint8_t> packed,
 }
 #endif
 
-// ── Q4_K × Q8_K, SMMLA (Task 3) ──────────────────────────────────────────────
+// ── Q4_K × Q8_K, SMMLA (quant.rs:394-429, 829-1000, 1024-1082, 1335-1615) ───
+
+float dot_q4_k_row_q8k_scalar(std::span<const uint8_t> row_data,
+                              std::span<const int8_t> x_i8,
+                              std::span<const float> x_scales,
+                              std::span<const int32_t> x_sums) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, 1, "dot_q4_k_row_q8k_scalar: activations shorter than the row");
+    check_len(
+        x_sums.size(), nb * (QK_K / QK), "dot_q4_k_row_q8k_scalar: x_sums shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* block = row_data.data() + b * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        int32_t isum = 0;
+        int32_t imin = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const int8_t* xlo = x_i8.data() + x_off;
+            const int8_t* xhi = x_i8.data() + x_off + 32;
+            int32_t dot_lo = 0;
+            int32_t dot_hi = 0;
+            for (size_t l = 0; l < 32; ++l) {
+                dot_lo += static_cast<int32_t>(qs[q_off + l] & 0x0F) * static_cast<int32_t>(xlo[l]);
+                dot_hi += static_cast<int32_t>(qs[q_off + l] >> 4) * static_cast<int32_t>(xhi[l]);
+            }
+            isum += static_cast<int32_t>(sc1) * dot_lo + static_cast<int32_t>(sc2) * dot_hi;
+            imin += static_cast<int32_t>(m1) * x_sums[x_off / QK] +
+                    static_cast<int32_t>(m2) * x_sums[(x_off + 32) / QK];
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+        acc += x_scales[b] * (d * static_cast<float>(isum) - dmin * static_cast<float>(imin));
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+namespace {
+// 2×2 int8 matrix-multiply-accumulate — Rust's `smmla_s32` inline asm: treats `a` and `b` as
+// row-major 2×8 i8 matrices and accumulates a·bᵀ into the four lanes `[a0·b0, a0·b1, a1·b0, a1·b1]`.
+SAPIENT_TARGET_I8MM inline int32x4_t smmla_s32(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    return vmmlaq_s32(acc, a, b);
+}
+// TRN1 / TRN2 on the 64-bit halves of two i8 vectors: `[a.lo, b.lo]` / `[a.hi, b.hi]`.
+inline int8x16_t vtrn1q_s64_s8(int8x16_t a, int8x16_t b) {
+    return vreinterpretq_s8_s64(vtrn1q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b)));
+}
+inline int8x16_t vtrn2q_s64_s8(int8x16_t a, int8x16_t b) {
+    return vreinterpretq_s8_s64(vtrn2q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b)));
+}
+} // namespace
+
+SAPIENT_TARGET_DOTPROD float dot_q4_k_row_q8k_neon(std::span<const uint8_t> row_data,
+                                                   std::span<const int8_t> x_i8,
+                                                   std::span<const float> x_scales,
+                                                   std::span<const int32_t> x_sums) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_q8_row(nb, x_i8, x_scales, 1, "dot_q4_k_row_q8k_neon: activations shorter than the row");
+    check_len(
+        x_sums.size(), nb * (QK_K / QK), "dot_q4_k_row_q8k_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* block = row_data.data() + b * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        int32_t isum = 0;
+        int32_t imin = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const uint8x16_t q0 = vld1q_u8(qs + q_off);
+            const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+            const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+            const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+            const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+            const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+            const int32x4_t zero = vdupq_n_s32(0);
+            const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+            const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+            isum += static_cast<int32_t>(sc1) * dot_lo + static_cast<int32_t>(sc2) * dot_hi;
+            imin += static_cast<int32_t>(m1) * x_sums[x_off / QK] +
+                    static_cast<int32_t>(m2) * x_sums[(x_off + 32) / QK];
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+        acc += x_scales[b] * (d * static_cast<float>(isum) - dmin * static_cast<float>(imin));
+    }
+    return acc;
+}
+
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q4_k_4rows_q8k_neon(std::array<std::span<const uint8_t>, 4> rows,
+                        std::span<const int8_t> x_i8,
+                        std::span<const float> x_scales,
+                        std::span<const int32_t> x_sums) {
+    const size_t n_blocks = rows[0].size() / Q4_K_BLOCK_BYTES;
+    for (const auto& r : rows)
+        check_len(r.size(),
+                  n_blocks * Q4_K_BLOCK_BYTES,
+                  "dot_q4_k_4rows_q8k_neon: row shorter than row 0");
+    const size_t nb_eff = std::min(n_blocks, x_scales.size()); // .take(n_blocks) over x_scales
+    check_len(x_i8.size(), nb_eff * QK_K, "dot_q4_k_4rows_q8k_neon: x_i8 shorter than the row");
+    check_len(x_sums.size(),
+              nb_eff * (QK_K / QK),
+              "dot_q4_k_4rows_q8k_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb_eff; ++bi) {
+        const float db = x_scales[bi];
+        const size_t base = bi * Q4_K_BLOCK_BYTES;
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(rows[r].data() + base);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        int32_t isum[4] = {0, 0, 0, 0};
+        int32_t imin[4] = {0, 0, 0, 0};
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+            const int32_t sum_lo = x_sums[x_off / QK];
+            const int32_t sum_hi = x_sums[(x_off + 32) / QK];
+            for (size_t r = 0; r < 4; ++r) {
+                const uint8_t* b = rows[r].data() + base;
+                const uint8_t* scales = b + 4;
+                const uint8_t* qs = b + 16;
+                const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                const uint8x16_t q0 = vld1q_u8(qs + q_off);
+                const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+                const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+                const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+                const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+                const int32x4_t zero = vdupq_n_s32(0);
+                const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+                const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+                isum[r] += static_cast<int32_t>(sc1) * dot_lo + static_cast<int32_t>(sc2) * dot_hi;
+                imin[r] += static_cast<int32_t>(m1) * sum_lo + static_cast<int32_t>(m2) * sum_hi;
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+        for (size_t r = 0; r < 4; ++r)
+            acc[r] +=
+                db * (dv[r] * static_cast<float>(isum[r]) - dminv[r] * static_cast<float>(imin[r]));
+    }
+    return acc;
+}
+
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q4_k_4rows_r4_q8k_neon(std::span<const uint8_t> packed,
+                           std::span<const int8_t> x_i8,
+                           std::span<const float> x_scales,
+                           std::span<const int32_t> x_sums) {
+    const size_t nb = packed.size() / (4 * Q4_K_BLOCK_BYTES);
+    const size_t nb_eff = std::min(nb, x_scales.size()); // .take(nb)
+    check_len(x_i8.size(), nb_eff * QK_K, "dot_q4_k_4rows_r4_q8k_neon: x_i8 shorter than the row");
+    check_len(x_sums.size(),
+              nb_eff * (QK_K / QK),
+              "dot_q4_k_4rows_r4_q8k_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb_eff; ++b) {
+        const float db = x_scales[b];
+        const size_t gbase = b * 4 * Q4_K_BLOCK_BYTES;
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(packed.data() + gbase + r * Q4_K_BLOCK_BYTES);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        int32_t isum[4] = {0, 0, 0, 0};
+        int32_t imin[4] = {0, 0, 0, 0};
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+            const int32_t sum_lo = x_sums[x_off / QK];
+            const int32_t sum_hi = x_sums[(x_off + 32) / QK];
+            for (size_t r = 0; r < 4; ++r) {
+                const uint8_t* blk = packed.data() + gbase + r * Q4_K_BLOCK_BYTES;
+                const uint8_t* scales = blk + 4;
+                const uint8_t* qs = blk + 16;
+                const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                const uint8x16_t q0 = vld1q_u8(qs + q_off);
+                const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+                const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+                const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+                const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+                const int32x4_t zero = vdupq_n_s32(0);
+                const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+                const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+                isum[r] += static_cast<int32_t>(sc1) * dot_lo + static_cast<int32_t>(sc2) * dot_hi;
+                imin[r] += static_cast<int32_t>(m1) * sum_lo + static_cast<int32_t>(m2) * sum_hi;
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+        for (size_t r = 0; r < 4; ++r)
+            acc[r] +=
+                db * (dv[r] * static_cast<float>(isum[r]) - dminv[r] * static_cast<float>(imin[r]));
+    }
+    return acc;
+}
+
+// Four Q4_K rows (R4) × TWO per-32 int8 activation rows via `smmla` (quant.rs:861-990). Each
+// 16-weight segment-pair costs two `trn` shuffles + one `smmla` per weight-row pair; the dots come
+// out in lane order [r0·x0, r0·x1, r1·x0, r1·x1] and the f32 combine is dot_q4_k_row_q8_neon's.
+SAPIENT_TARGET_I8MM std::array<std::array<float, 2>, 4>
+dot_q4_k_4rows_r4_x2_smmla(std::span<const uint8_t> packed,
+                           std::span<const int8_t> x0_i8,
+                           std::span<const float> x0_scales,
+                           std::span<const int32_t> x0_sums,
+                           std::span<const int8_t> x1_i8,
+                           std::span<const float> x1_scales,
+                           std::span<const int32_t> x1_sums) {
+    const size_t nb = packed.size() / (4 * Q4_K_BLOCK_BYTES);
+    check_q8_row(
+        nb, x0_i8, x0_scales, QK_K / QK, "dot_q4_k_4rows_r4_x2_smmla: x0 shorter than the row");
+    check_q8_row(
+        nb, x1_i8, x1_scales, QK_K / QK, "dot_q4_k_4rows_r4_x2_smmla: x1 shorter than the row");
+    check_len(x0_sums.size(),
+              nb * (QK_K / QK),
+              "dot_q4_k_4rows_r4_x2_smmla: x0_sums shorter than the row");
+    check_len(x1_sums.size(),
+              nb * (QK_K / QK),
+              "dot_q4_k_4rows_r4_x2_smmla: x1_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<std::array<float, 2>, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t gbase = b * 4 * Q4_K_BLOCK_BYTES;
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(packed.data() + gbase + r * Q4_K_BLOCK_BYTES);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            // Activation vectors for BOTH rows, once; per-sub-block sums precomputed.
+            const int8x16_t x0lo0 = vld1q_s8(x0_i8.data() + x_off);
+            const int8x16_t x0lo1 = vld1q_s8(x0_i8.data() + x_off + 16);
+            const int8x16_t x0hi0 = vld1q_s8(x0_i8.data() + x_off + 32);
+            const int8x16_t x0hi1 = vld1q_s8(x0_i8.data() + x_off + 48);
+            const int8x16_t x1lo0 = vld1q_s8(x1_i8.data() + x_off);
+            const int8x16_t x1lo1 = vld1q_s8(x1_i8.data() + x_off + 16);
+            const int8x16_t x1hi0 = vld1q_s8(x1_i8.data() + x_off + 32);
+            const int8x16_t x1hi1 = vld1q_s8(x1_i8.data() + x_off + 48);
+            const int32_t sum_lo[2] = {x0_sums[x_off / QK], x1_sums[x_off / QK]};
+            const int32_t sum_hi[2] = {x0_sums[(x_off + 32) / QK], x1_sums[(x_off + 32) / QK]};
+            const float xs_lo[2] = {x0_scales[x_off / QK], x1_scales[x_off / QK]};
+            const float xs_hi[2] = {x0_scales[(x_off + 32) / QK], x1_scales[(x_off + 32) / QK]};
+            // Pair the two activation rows per 8-byte k-segment: [x0_seg, x1_seg].
+            const int8x16_t xlo_a = vtrn1q_s64_s8(x0lo0, x1lo0);
+            const int8x16_t xlo_b = vtrn2q_s64_s8(x0lo0, x1lo0);
+            const int8x16_t xlo_c = vtrn1q_s64_s8(x0lo1, x1lo1);
+            const int8x16_t xlo_d = vtrn2q_s64_s8(x0lo1, x1lo1);
+            const int8x16_t xhi_a = vtrn1q_s64_s8(x0hi0, x1hi0);
+            const int8x16_t xhi_b = vtrn2q_s64_s8(x0hi0, x1hi0);
+            const int8x16_t xhi_c = vtrn1q_s64_s8(x0hi1, x1hi1);
+            const int8x16_t xhi_d = vtrn2q_s64_s8(x0hi1, x1hi1);
+
+            for (size_t pair = 0; pair < 2; ++pair) {
+                const size_t r0 = pair * 2;
+                const size_t r1 = pair * 2 + 1;
+                const uint8_t* qs0 = packed.data() + gbase + r0 * Q4_K_BLOCK_BYTES + 16;
+                const uint8_t* qs1 = packed.data() + gbase + r1 * Q4_K_BLOCK_BYTES + 16;
+                const uint8x16_t q0a = vld1q_u8(qs0 + q_off);
+                const uint8x16_t q0b = vld1q_u8(qs0 + q_off + 16);
+                const uint8x16_t q1a = vld1q_u8(qs1 + q_off);
+                const uint8x16_t q1b = vld1q_u8(qs1 + q_off + 16);
+                const int8x16_t lo0a = vreinterpretq_s8_u8(vandq_u8(q0a, mask));
+                const int8x16_t lo0b = vreinterpretq_s8_u8(vandq_u8(q0b, mask));
+                const int8x16_t lo1a = vreinterpretq_s8_u8(vandq_u8(q1a, mask));
+                const int8x16_t lo1b = vreinterpretq_s8_u8(vandq_u8(q1b, mask));
+                const int8x16_t hi0a = vreinterpretq_s8_u8(vshrq_n_u8(q0a, 4));
+                const int8x16_t hi0b = vreinterpretq_s8_u8(vshrq_n_u8(q0b, 4));
+                const int8x16_t hi1a = vreinterpretq_s8_u8(vshrq_n_u8(q1a, 4));
+                const int8x16_t hi1b = vreinterpretq_s8_u8(vshrq_n_u8(q1b, 4));
+                // Weight-row pairs per 8-byte k-segment: [w_r0_seg, w_r1_seg].
+                const int8x16_t wlo_a = vtrn1q_s64_s8(lo0a, lo1a);
+                const int8x16_t wlo_b = vtrn2q_s64_s8(lo0a, lo1a);
+                const int8x16_t wlo_c = vtrn1q_s64_s8(lo0b, lo1b);
+                const int8x16_t wlo_d = vtrn2q_s64_s8(lo0b, lo1b);
+                const int8x16_t whi_a = vtrn1q_s64_s8(hi0a, hi1a);
+                const int8x16_t whi_b = vtrn2q_s64_s8(hi0a, hi1a);
+                const int8x16_t whi_c = vtrn1q_s64_s8(hi0b, hi1b);
+                const int8x16_t whi_d = vtrn2q_s64_s8(hi0b, hi1b);
+
+                const int32x4_t zero = vdupq_n_s32(0);
+                int32x4_t dlo = smmla_s32(zero, wlo_a, xlo_a);
+                dlo = smmla_s32(dlo, wlo_b, xlo_b);
+                dlo = smmla_s32(dlo, wlo_c, xlo_c);
+                dlo = smmla_s32(dlo, wlo_d, xlo_d);
+                int32x4_t dhi = smmla_s32(zero, whi_a, xhi_a);
+                dhi = smmla_s32(dhi, whi_b, xhi_b);
+                dhi = smmla_s32(dhi, whi_c, xhi_c);
+                dhi = smmla_s32(dhi, whi_d, xhi_d);
+                const int32_t dlo_arr[4] = {vgetq_lane_s32(dlo, 0),
+                                            vgetq_lane_s32(dlo, 1),
+                                            vgetq_lane_s32(dlo, 2),
+                                            vgetq_lane_s32(dlo, 3)};
+                const int32_t dhi_arr[4] = {vgetq_lane_s32(dhi, 0),
+                                            vgetq_lane_s32(dhi, 1),
+                                            vgetq_lane_s32(dhi, 2),
+                                            vgetq_lane_s32(dhi, 3)};
+
+                const size_t rows2[2] = {r0, r1};
+                for (size_t ri = 0; ri < 2; ++ri) {
+                    const size_t row = rows2[ri];
+                    const uint8_t* scales = packed.data() + gbase + row * Q4_K_BLOCK_BYTES + 4;
+                    const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                    const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                    const float d1 = dv[row] * static_cast<float>(sc1);
+                    const float m1v = dminv[row] * static_cast<float>(m1);
+                    const float d2 = dv[row] * static_cast<float>(sc2);
+                    const float m2v = dminv[row] * static_cast<float>(m2);
+                    for (size_t xr = 0; xr < 2; ++xr) {
+                        const int32_t dot_lo = dlo_arr[ri * 2 + xr];
+                        const int32_t dot_hi = dhi_arr[ri * 2 + xr];
+                        acc[row][xr] += xs_lo[xr] * (d1 * static_cast<float>(dot_lo) -
+                                                     m1v * static_cast<float>(sum_lo[xr]));
+                        acc[row][xr] += xs_hi[xr] * (d2 * static_cast<float>(dot_hi) -
+                                                     m2v * static_cast<float>(sum_hi[xr]));
+                    }
+                }
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
+// Same trn/smmla core with the integer-domain combine of dot_q4_k_row_q8k_neon (quant.rs:1487-1615).
+SAPIENT_TARGET_I8MM std::array<std::array<float, 2>, 4>
+dot_q4_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
+                               std::span<const int8_t> x0_i8,
+                               std::span<const float> x0_scales,
+                               std::span<const int32_t> x0_sums,
+                               std::span<const int8_t> x1_i8,
+                               std::span<const float> x1_scales,
+                               std::span<const int32_t> x1_sums) {
+    const size_t nb = packed.size() / (4 * Q4_K_BLOCK_BYTES);
+    const size_t nb_eff = std::min({nb, x0_scales.size(), x1_scales.size()}); // zip().take(nb)
+    check_len(
+        x0_i8.size(), nb_eff * QK_K, "dot_q4_k_4rows_r4_x2_q8k_smmla: x0 shorter than the row");
+    check_len(
+        x1_i8.size(), nb_eff * QK_K, "dot_q4_k_4rows_r4_x2_q8k_smmla: x1 shorter than the row");
+    check_len(x0_sums.size(),
+              nb_eff * (QK_K / QK),
+              "dot_q4_k_4rows_r4_x2_q8k_smmla: x0_sums shorter than the row");
+    check_len(x1_sums.size(),
+              nb_eff * (QK_K / QK),
+              "dot_q4_k_4rows_r4_x2_q8k_smmla: x1_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<std::array<float, 2>, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb_eff; ++b) {
+        const float db[2] = {x0_scales[b], x1_scales[b]};
+        const size_t gbase = b * 4 * Q4_K_BLOCK_BYTES;
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(packed.data() + gbase + r * Q4_K_BLOCK_BYTES);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        int32_t isum[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+        int32_t imin[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const int8x16_t x0lo0 = vld1q_s8(x0_i8.data() + x_off);
+            const int8x16_t x0lo1 = vld1q_s8(x0_i8.data() + x_off + 16);
+            const int8x16_t x0hi0 = vld1q_s8(x0_i8.data() + x_off + 32);
+            const int8x16_t x0hi1 = vld1q_s8(x0_i8.data() + x_off + 48);
+            const int8x16_t x1lo0 = vld1q_s8(x1_i8.data() + x_off);
+            const int8x16_t x1lo1 = vld1q_s8(x1_i8.data() + x_off + 16);
+            const int8x16_t x1hi0 = vld1q_s8(x1_i8.data() + x_off + 32);
+            const int8x16_t x1hi1 = vld1q_s8(x1_i8.data() + x_off + 48);
+            const int32_t sum_lo[2] = {x0_sums[x_off / QK], x1_sums[x_off / QK]};
+            const int32_t sum_hi[2] = {x0_sums[(x_off + 32) / QK], x1_sums[(x_off + 32) / QK]};
+            const int8x16_t xlo_a = vtrn1q_s64_s8(x0lo0, x1lo0);
+            const int8x16_t xlo_b = vtrn2q_s64_s8(x0lo0, x1lo0);
+            const int8x16_t xlo_c = vtrn1q_s64_s8(x0lo1, x1lo1);
+            const int8x16_t xlo_d = vtrn2q_s64_s8(x0lo1, x1lo1);
+            const int8x16_t xhi_a = vtrn1q_s64_s8(x0hi0, x1hi0);
+            const int8x16_t xhi_b = vtrn2q_s64_s8(x0hi0, x1hi0);
+            const int8x16_t xhi_c = vtrn1q_s64_s8(x0hi1, x1hi1);
+            const int8x16_t xhi_d = vtrn2q_s64_s8(x0hi1, x1hi1);
+
+            for (size_t pair = 0; pair < 2; ++pair) {
+                const size_t r0 = pair * 2;
+                const size_t r1 = pair * 2 + 1;
+                const uint8_t* qs0 = packed.data() + gbase + r0 * Q4_K_BLOCK_BYTES + 16;
+                const uint8_t* qs1 = packed.data() + gbase + r1 * Q4_K_BLOCK_BYTES + 16;
+                const uint8x16_t q0a = vld1q_u8(qs0 + q_off);
+                const uint8x16_t q0b = vld1q_u8(qs0 + q_off + 16);
+                const uint8x16_t q1a = vld1q_u8(qs1 + q_off);
+                const uint8x16_t q1b = vld1q_u8(qs1 + q_off + 16);
+                const int8x16_t lo0a = vreinterpretq_s8_u8(vandq_u8(q0a, mask));
+                const int8x16_t lo0b = vreinterpretq_s8_u8(vandq_u8(q0b, mask));
+                const int8x16_t lo1a = vreinterpretq_s8_u8(vandq_u8(q1a, mask));
+                const int8x16_t lo1b = vreinterpretq_s8_u8(vandq_u8(q1b, mask));
+                const int8x16_t hi0a = vreinterpretq_s8_u8(vshrq_n_u8(q0a, 4));
+                const int8x16_t hi0b = vreinterpretq_s8_u8(vshrq_n_u8(q0b, 4));
+                const int8x16_t hi1a = vreinterpretq_s8_u8(vshrq_n_u8(q1a, 4));
+                const int8x16_t hi1b = vreinterpretq_s8_u8(vshrq_n_u8(q1b, 4));
+                const int8x16_t wlo_a = vtrn1q_s64_s8(lo0a, lo1a);
+                const int8x16_t wlo_b = vtrn2q_s64_s8(lo0a, lo1a);
+                const int8x16_t wlo_c = vtrn1q_s64_s8(lo0b, lo1b);
+                const int8x16_t wlo_d = vtrn2q_s64_s8(lo0b, lo1b);
+                const int8x16_t whi_a = vtrn1q_s64_s8(hi0a, hi1a);
+                const int8x16_t whi_b = vtrn2q_s64_s8(hi0a, hi1a);
+                const int8x16_t whi_c = vtrn1q_s64_s8(hi0b, hi1b);
+                const int8x16_t whi_d = vtrn2q_s64_s8(hi0b, hi1b);
+
+                const int32x4_t zero = vdupq_n_s32(0);
+                int32x4_t dlo = smmla_s32(zero, wlo_a, xlo_a);
+                dlo = smmla_s32(dlo, wlo_b, xlo_b);
+                dlo = smmla_s32(dlo, wlo_c, xlo_c);
+                dlo = smmla_s32(dlo, wlo_d, xlo_d);
+                int32x4_t dhi = smmla_s32(zero, whi_a, xhi_a);
+                dhi = smmla_s32(dhi, whi_b, xhi_b);
+                dhi = smmla_s32(dhi, whi_c, xhi_c);
+                dhi = smmla_s32(dhi, whi_d, xhi_d);
+                const int32_t dlo_arr[4] = {vgetq_lane_s32(dlo, 0),
+                                            vgetq_lane_s32(dlo, 1),
+                                            vgetq_lane_s32(dlo, 2),
+                                            vgetq_lane_s32(dlo, 3)};
+                const int32_t dhi_arr[4] = {vgetq_lane_s32(dhi, 0),
+                                            vgetq_lane_s32(dhi, 1),
+                                            vgetq_lane_s32(dhi, 2),
+                                            vgetq_lane_s32(dhi, 3)};
+
+                const size_t rows2[2] = {r0, r1};
+                for (size_t ri = 0; ri < 2; ++ri) {
+                    const size_t row = rows2[ri];
+                    const uint8_t* scales = packed.data() + gbase + row * Q4_K_BLOCK_BYTES + 4;
+                    const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                    const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                    for (size_t xr = 0; xr < 2; ++xr) {
+                        const int32_t dot_lo = dlo_arr[ri * 2 + xr];
+                        const int32_t dot_hi = dhi_arr[ri * 2 + xr];
+                        isum[row][xr] +=
+                            static_cast<int32_t>(sc1) * dot_lo + static_cast<int32_t>(sc2) * dot_hi;
+                        imin[row][xr] += static_cast<int32_t>(m1) * sum_lo[xr] +
+                                         static_cast<int32_t>(m2) * sum_hi[xr];
+                    }
+                }
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+        for (size_t r = 0; r < 4; ++r)
+            for (size_t xr = 0; xr < 2; ++xr)
+                acc[r][xr] += db[xr] * (dv[r] * static_cast<float>(isum[r][xr]) -
+                                        dminv[r] * static_cast<float>(imin[r][xr]));
+    }
+    return acc;
+}
+#endif
+
+// ── Q5_K, Q6_K f32, Q6_K repack/R4 f32 (Task 4) ──────────────────────────────
 
 } // namespace sapient::backends_cpu::kernels::quant

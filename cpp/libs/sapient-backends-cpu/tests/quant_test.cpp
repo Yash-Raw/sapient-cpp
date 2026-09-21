@@ -31,6 +31,7 @@ using namespace sapient::backends_cpu::kernels::quant;
 // where an unguarded using-declaration would be unused (misc-unused-using-decls). has_i8mm() has
 // no Task 1 caller at all — Task 3 adds its own using-declaration when it first calls it.
 using sapient::backends_cpu::cpu_features::has_dotprod;
+using sapient::backends_cpu::cpu_features::has_i8mm;
 #endif
 
 namespace {
@@ -427,3 +428,139 @@ TEST(QuantDeath, repack_q4_k_rows4_asserts_like_rust) {
     EXPECT_DEATH((void)repack_q4_k_rows4(four_rows, 4, 200), "");
     EXPECT_DEATH((void)repack_q4_k_rows4(two_rows, 4, 256), ""); // blocks.len() != n * row_bytes
 }
+
+// ── Q4_K × Q8_K, SMMLA (Task 3) ───────────────────────────────────────────────
+
+namespace {
+// quant.rs q4_k_q8k_scalar_matches_f32_path / *_q8k_kernels_match_single_row: rows filled with
+// `(i*A + B) % M` bytes, then every block's d/dmin overwritten with fixed f16 values.
+std::vector<uint8_t>
+q4_k_mod_rows(size_t n, size_t k, size_t a, size_t b, size_t m, float d, float dmin) {
+    const size_t row_bytes = k / QK_K * Q4_K_BLOCK_BYTES;
+    std::vector<uint8_t> rows(n * row_bytes);
+    for (size_t i = 0; i < rows.size(); ++i)
+        rows[i] = static_cast<uint8_t>((i * a + b) % m);
+    for (size_t r = 0; r < n; ++r)
+        for (size_t blk = 0; blk < k / QK_K; ++blk) {
+            uint8_t* base = rows.data() + r * row_bytes + blk * Q4_K_BLOCK_BYTES;
+            sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(d), base);
+            sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(dmin), base + 2);
+        }
+    return rows;
+}
+} // namespace
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q4_k_smmla_x2_matches_single_row) {
+    if (!has_i8mm()) GTEST_SKIP() << "i8mm not available";
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / 256 * Q4_K_BLOCK_BYTES;
+    const auto rows = q4_k_test_rows(n, k, 0x18AAULL);
+    const auto x0 = ramp(k, 37, 97, 48.0f, 0.02f);
+    const auto x1 = ramp(k, 59, 101, 50.0f, 0.015f);
+    const auto q0 = quantize_row_to_i8_blocks(x0);
+    const auto q1 = quantize_row_to_i8_blocks(x1);
+    const auto b0 = i8_block_sums(q0.q);
+    const auto b1 = i8_block_sums(q1.q);
+    const auto packed = repack_q4_k_rows4(rows, n, k);
+    const auto got = dot_q4_k_4rows_r4_x2_smmla(packed, q0.q, q0.scales, b0, q1.q, q1.scales, b1);
+    for (size_t r = 0; r < 4; ++r) {
+        const auto row = row_of(rows, r, row_bytes);
+        const float w0 = dot_q4_k_row_q8_neon(row, q0.q, q0.scales, b0);
+        const float w1 = dot_q4_k_row_q8_neon(row, q1.q, q1.scales, b1);
+        EXPECT_EQ(bits(got[r][0]), bits(w0)) << "row " << r << " x0: " << got[r][0] << " vs " << w0;
+        EXPECT_EQ(bits(got[r][1]), bits(w1)) << "row " << r << " x1: " << got[r][1] << " vs " << w1;
+    }
+}
+#endif
+
+TEST(Quant, q4_k_q8k_scalar_matches_f32_path) {
+    const size_t nblocks = 3;
+    const auto row = q4_k_mod_rows(1, nblocks * QK_K, 197, 13, 251, 0.05f, 0.03f);
+    uint64_t state = 0x2545F4914F6CDD1DULL;
+    auto next = [&state]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    std::vector<float> x(nblocks * QK_K);
+    for (float& v : x)
+        v = (static_cast<float>(next()) /
+             static_cast<float>(std::numeric_limits<uint64_t>::max())) *
+                4.0f -
+            2.0f;
+
+    const float f32_dot = dot_q4_k_row_f32(row, x);
+    const auto k8 = quantize_row_to_q8k(x);
+    const float q8k_dot = dot_q4_k_row_q8k_scalar(row, k8.q, k8.scales, k8.sums);
+    const float rel = ::fabsf(f32_dot - q8k_dot) / ::fmaxf(::fabsf(f32_dot), 1e-3f);
+    EXPECT_LT(rel, 0.03f) << "Q8_K mismatch: f32=" << f32_dot << " q8k=" << q8k_dot;
+
+    // The per-256 format must stay in the accuracy class of the accepted per-32 W4A8 path.
+    const auto p = quantize_row_to_i8_blocks(x);
+    const auto psum = i8_block_sums(p.q);
+    const float w4a8 = dot_q4_k_row_q8_scalar(row, p.q, p.scales, psum);
+    const float rel_vs = ::fabsf(w4a8 - q8k_dot) / ::fmaxf(::fabsf(w4a8), 1e-3f);
+    EXPECT_LT(rel_vs, 0.03f) << "Q8_K vs W4A8 divergence: w4a8=" << w4a8 << " q8k=" << q8k_dot;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (has_dotprod()) {
+        const float neon = dot_q4_k_row_q8k_neon(row, k8.q, k8.scales, k8.sums);
+        EXPECT_EQ(bits(neon), bits(q8k_dot)) << "NEON≠scalar Q8_K: " << neon << " vs " << q8k_dot;
+    }
+#endif
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q4_k_r4_q8k_kernels_match_single_row) {
+    // Rust runs the dotprod kernels unconditionally here; the port skips on a non-dotprod host.
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / QK_K * Q4_K_BLOCK_BYTES;
+    const auto rows = q4_k_mod_rows(n, k, 149, 29, 249, 0.04f, 0.02f);
+    const auto x0 = ramp(k, 37, 97, 48.0f, 0.02f);
+    const auto x1 = ramp(k, 59, 101, 50.0f, 0.015f);
+    const auto r0 = quantize_row_to_q8k(x0);
+    const auto r1 = quantize_row_to_q8k(x1);
+    const auto packed = repack_q4_k_rows4(rows, n, k);
+
+    // 4-row R4 kernel vs single-row Q8_K kernel, exact bits.
+    const auto got4 = dot_q4_k_4rows_r4_q8k_neon(packed, r0.q, r0.scales, r0.sums);
+    for (size_t r = 0; r < 4; ++r) {
+        const float want =
+            dot_q4_k_row_q8k_neon(row_of(rows, r, row_bytes), r0.q, r0.scales, r0.sums);
+        EXPECT_EQ(bits(got4[r]), bits(want)) << "r4 row " << r << ": " << got4[r] << " vs " << want;
+    }
+    // SMMLA x2 kernel vs single-row, exact bits over both x rows.
+    if (has_i8mm()) {
+        const auto got = dot_q4_k_4rows_r4_x2_q8k_smmla(
+            packed, r0.q, r0.scales, r0.sums, r1.q, r1.scales, r1.sums);
+        for (size_t r = 0; r < 4; ++r) {
+            const auto row = row_of(rows, r, row_bytes);
+            const float w0 = dot_q4_k_row_q8k_neon(row, r0.q, r0.scales, r0.sums);
+            const float w1 = dot_q4_k_row_q8k_neon(row, r1.q, r1.scales, r1.sums);
+            EXPECT_EQ(bits(got[r][0]), bits(w0)) << "smmla row " << r << " x0";
+            EXPECT_EQ(bits(got[r][1]), bits(w1)) << "smmla row " << r << " x1";
+        }
+    }
+}
+
+TEST(Quant, q4_k_plain_4rows_q8k_matches_single_row) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available"; // port-added skip (see Task 3)
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / QK_K * Q4_K_BLOCK_BYTES;
+    const auto rows = q4_k_mod_rows(n, k, 167, 43, 247, 0.04f, 0.02f);
+    const auto x = ramp(k, 41, 103, 51.0f, 0.02f);
+    const auto r = quantize_row_to_q8k(x);
+    const std::array<std::span<const uint8_t>, 4> r4 = {row_of(rows, 0, row_bytes),
+                                                        row_of(rows, 1, row_bytes),
+                                                        row_of(rows, 2, row_bytes),
+                                                        row_of(rows, 3, row_bytes)};
+    const auto got = dot_q4_k_4rows_q8k_neon(r4, r.q, r.scales, r.sums);
+    for (size_t o = 0; o < 4; ++o) {
+        const float want = dot_q4_k_row_q8k_neon(r4[o], r.q, r.scales, r.sums);
+        EXPECT_EQ(bits(got[o]), bits(want)) << "row " << o << ": " << got[o] << " vs " << want;
+    }
+}
+#endif

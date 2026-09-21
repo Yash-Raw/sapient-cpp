@@ -151,7 +151,52 @@ float dot_q4_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const f
 #endif
 } // namespace detail
 
-// ── Q4_K × Q8_K, SMMLA (Task 3) ─────────────────────────────────────────────────
+// ── Q4_K × Q8_K activations (integer-domain sub-scale combine), SMMLA prefill ───
+/// Scalar oracle: per super-block `isum = Σ sc·dot`, `imin = Σ mn·bsum` in i32, then ONE
+/// `acc += x_scales[b] · (d·isum − dmin·imin)`. `x_scales` has one f32 per 256, `x_sums` one i32 per 32.
+float dot_q4_k_row_q8k_scalar(std::span<const uint8_t> row_data,
+                              std::span<const int8_t> x_i8,
+                              std::span<const float> x_scales,
+                              std::span<const int32_t> x_sums);
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// `sdot` core + integer-domain combine; bit-identical to `dot_q4_k_row_q8k_scalar`. Precondition: dotprod.
+float dot_q4_k_row_q8k_neon(std::span<const uint8_t> row_data,
+                            std::span<const int8_t> x_i8,
+                            std::span<const float> x_scales,
+                            std::span<const int32_t> x_sums);
+/// Four row-major rows × one Q8_K row; lanes bit-identical to `dot_q4_k_row_q8k_neon`. Iterates
+/// `min(n_blocks, x_scales.size())` blocks (Rust `.take(n_blocks)`). Precondition: dotprod.
+std::array<float, 4> dot_q4_k_4rows_q8k_neon(std::array<std::span<const uint8_t>, 4> rows,
+                                             std::span<const int8_t> x_i8,
+                                             std::span<const float> x_scales,
+                                             std::span<const int32_t> x_sums);
+/// Four R4 rows × one Q8_K row; same lane identity and `.take` rule. Precondition: dotprod.
+std::array<float, 4> dot_q4_k_4rows_r4_q8k_neon(std::span<const uint8_t> packed,
+                                                std::span<const int8_t> x_i8,
+                                                std::span<const float> x_scales,
+                                                std::span<const int32_t> x_sums);
+/// Four R4 rows × TWO per-32 int8 activation rows via `smmla` — the prefill kernel. Returns
+/// `[[row0·x0, row0·x1], …, [row3·x0, row3·x1]]`, every lane bit-identical to
+/// `dot_q4_k_row_q8_neon`. Precondition: i8mm.
+std::array<std::array<float, 2>, 4> dot_q4_k_4rows_r4_x2_smmla(std::span<const uint8_t> packed,
+                                                               std::span<const int8_t> x0_i8,
+                                                               std::span<const float> x0_scales,
+                                                               std::span<const int32_t> x0_sums,
+                                                               std::span<const int8_t> x1_i8,
+                                                               std::span<const float> x1_scales,
+                                                               std::span<const int32_t> x1_sums);
+/// Four R4 rows × TWO Q8_K rows via `smmla`; lanes bit-identical to `dot_q4_k_row_q8k_neon`;
+/// iterates `min(nb, x0_scales.size(), x1_scales.size())` blocks. Precondition: i8mm.
+std::array<std::array<float, 2>, 4>
+dot_q4_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
+                               std::span<const int8_t> x0_i8,
+                               std::span<const float> x0_scales,
+                               std::span<const int32_t> x0_sums,
+                               std::span<const int8_t> x1_i8,
+                               std::span<const float> x1_scales,
+                               std::span<const int32_t> x1_sums);
+#endif
+
 // ── Q5_K, Q6_K f32, Q6_K repack/R4 f32 (Task 4) ─────────────────────────────────
 // ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ───────────────────────────────────────────
 
