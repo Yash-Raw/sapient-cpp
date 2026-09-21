@@ -23,7 +23,8 @@ TEST(Error, error_display) {
 
 // Rust: from_io_error
 TEST(Error, from_io_error) {
-    const auto e = Error::io(std::make_error_code(std::errc::no_such_file_or_directory), "file missing");
+    const auto e =
+        Error::io(std::make_error_code(std::errc::no_such_file_or_directory), "file missing");
     EXPECT_EQ(e.code, ErrorCode::Io);
     EXPECT_EQ(e.to_string().rfind("IO error: ", 0), 0u) << e.to_string();
 }
@@ -34,7 +35,8 @@ TEST(Error, messages_match_rust_format_strings) {
               "Type mismatch: expected a quantized dtype, got f32");
     EXPECT_EQ(Error::broadcast({2, 3}, {2, 4}).to_string(),
               "Incompatible shapes for broadcasting: [2, 3] and [2, 4]");
-    EXPECT_EQ(Error::cyclic_graph().to_string(), "Graph contains a cycle — execution is impossible");
+    EXPECT_EQ(Error::cyclic_graph().to_string(),
+              "Graph contains a cycle — execution is impossible");
     EXPECT_EQ(Error::node_not_found("x").to_string(), "Node \"x\" not found in graph");
     EXPECT_EQ(Error::invalid_graph("Shape has zero dimension at axis 1").to_string(),
               "Graph validation failed: Shape has zero dimension at axis 1");

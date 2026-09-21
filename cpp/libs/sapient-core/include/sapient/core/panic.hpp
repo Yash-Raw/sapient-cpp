@@ -17,4 +17,4 @@ namespace sapient::core {
     std::abort();
 }
 
-}  // namespace sapient::core
+} // namespace sapient::core

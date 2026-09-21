@@ -7,6 +7,7 @@
 // `to_string()` reproduces the `#[error("…")]` format strings byte for byte.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -18,19 +19,19 @@
 namespace sapient::core {
 
 enum class ErrorCode : uint8_t {
-    ShapeMismatch,         // {expected: Vec<usize>, got: Vec<usize>}
-    RankMismatch,          // {expected: usize, got: usize}
-    TypeMismatch,          // {expected: String, got: String}
-    BroadcastError,        // {lhs: Vec<usize>, rhs: Vec<usize>}
+    ShapeMismatch,  // {expected: Vec<usize>, got: Vec<usize>}
+    RankMismatch,   // {expected: usize, got: usize}
+    TypeMismatch,   // {expected: String, got: String}
+    BroadcastError, // {lhs: Vec<usize>, rhs: Vec<usize>}
     CyclicGraph,
-    NodeNotFound,          // (String)
-    InvalidGraph,          // (String)
-    ShapeInferenceFailed,  // {op, reason}
-    UnsupportedOp,         // {backend, op}
-    BackendError,          // {backend, message}
+    NodeNotFound,         // (String)
+    InvalidGraph,         // (String)
+    ShapeInferenceFailed, // {op, reason}
+    UnsupportedOp,        // {backend, op}
+    BackendError,         // {backend, message}
     NoBackendAvailable,
-    AllocationFailed,      // {bytes, align}
-    BufferSizeMismatch,    // {expected, got}
+    AllocationFailed,   // {bytes, align}
+    BufferSizeMismatch, // {expected, got}
     PoolExhausted,
     OnnxParseError,        // (String)
     GgufParseError,        // (String)
@@ -41,19 +42,22 @@ enum class ErrorCode : uint8_t {
     DeadlineExceeded,
     SchedulerShutdown,
     UninitializedRuntime,
-    TelemetryError,        // (String)
-    Internal,              // (String)
+    TelemetryError, // (String)
+    Internal,       // (String)
 };
 
 struct Error {
     ErrorCode code{ErrorCode::Internal};
-    std::vector<size_t> expected_dims;  // ShapeMismatch.expected / BroadcastError.lhs
-    std::vector<size_t> got_dims;       // ShapeMismatch.got / BroadcastError.rhs
-    size_t expected_n{0};               // RankMismatch.expected / AllocationFailed.bytes / BufferSizeMismatch.expected
-    size_t got_n{0};                    // RankMismatch.got / AllocationFailed.align / BufferSizeMismatch.got
-    std::string a;                      // first string field (TypeMismatch.expected, ShapeInferenceFailed.op, UnsupportedOp.backend, BackendError.backend, single-string variants)
-    std::string b;                      // second string field (TypeMismatch.got, ShapeInferenceFailed.reason, UnsupportedOp.op, BackendError.message)
-    std::error_code io_code;            // Io only
+    std::vector<size_t> expected_dims; // ShapeMismatch.expected / BroadcastError.lhs
+    std::vector<size_t> got_dims;      // ShapeMismatch.got / BroadcastError.rhs
+    size_t expected_n{
+        0};          // RankMismatch.expected / AllocationFailed.bytes / BufferSizeMismatch.expected
+    size_t got_n{0}; // RankMismatch.got / AllocationFailed.align / BufferSizeMismatch.got
+    std::string
+        a; // first string field (TypeMismatch.expected, ShapeInferenceFailed.op, UnsupportedOp.backend, BackendError.backend, single-string variants)
+    std::string
+        b; // second string field (TypeMismatch.got, ShapeInferenceFailed.reason, UnsupportedOp.op, BackendError.message)
+    std::error_code io_code; // Io only
 
     /// Byte-identical to Rust's `Display` (thiserror `#[error]` strings).
     std::string to_string() const;
@@ -86,28 +90,27 @@ struct Error {
     static Error internal(std::string msg);
 };
 
-template <class T>
-using Result = tl::expected<T, Error>;
+template <class T> using Result = tl::expected<T, Error>;
 
 /// Rust's `Debug` for `Vec<usize>`: "[2, 3]" ("[]" when empty).
 std::string debug_dims(const std::vector<size_t>& dims);
 
-}  // namespace sapient::core
+} // namespace sapient::core
 
 #define SAPIENT_CAT_(a, b) a##b
 #define SAPIENT_CAT(a, b) SAPIENT_CAT_(a, b)
 
 /// `expr?` for a Result whose value is discarded (or Result<void>).
-#define SAPIENT_TRY(expr)                                                       \
-    do {                                                                        \
-        auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                    \
-        if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                   \
-            return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error())); \
+#define SAPIENT_TRY(expr)                                                                          \
+    do {                                                                                           \
+        auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                                       \
+        if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                                      \
+            return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error()));       \
     } while (0)
 
 /// `lhs = expr?;` — `lhs` may be a declaration (`int v`) or an existing lvalue.
-#define SAPIENT_TRY_ASSIGN(lhs, expr)                                           \
-    auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                        \
-    if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                       \
-        return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error())); \
+#define SAPIENT_TRY_ASSIGN(lhs, expr)                                                              \
+    auto&& SAPIENT_CAT(sapient_try_, __LINE__) = (expr);                                           \
+    if (!SAPIENT_CAT(sapient_try_, __LINE__).has_value())                                          \
+        return ::tl::unexpected(std::move(SAPIENT_CAT(sapient_try_, __LINE__).error()));           \
     lhs = std::move(*SAPIENT_CAT(sapient_try_, __LINE__))
