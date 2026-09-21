@@ -20,6 +20,7 @@
 
 #include "sapient/backends_cpu/cpu_features.hpp"
 #include "sapient/backends_cpu/kernels/quant.hpp"
+#include "sapient/core/dequant.hpp"
 #include "sapient/core/dtype.hpp"
 #include "sapient/core/f16.hpp"
 #include "sapient/core/shape.hpp"
@@ -54,8 +55,7 @@ uint64_t lcg_step(uint64_t& s) {
     s = s * 6364136223846793005ULL + 1442695040888963407ULL;
     return s;
 }
-// [[maybe_unused]]: Tasks 2-5 append tests that call this; Task 1 alone does not.
-[[maybe_unused]] std::vector<uint8_t> lcg_bytes(uint64_t seed, size_t n) {
+std::vector<uint8_t> lcg_bytes(uint64_t seed, size_t n) {
     std::vector<uint8_t> v(n);
     for (uint8_t& b : v)
         b = static_cast<uint8_t>(lcg_step(seed) >> 33);
@@ -562,5 +562,323 @@ TEST(Quant, q4_k_plain_4rows_q8k_matches_single_row) {
         const float want = dot_q4_k_row_q8k_neon(r4[o], r.q, r.scales, r.sums);
         EXPECT_EQ(bits(got[o]), bits(want)) << "row " << o << ": " << got[o] << " vs " << want;
     }
+}
+
+// ── Q5_K, Q6_K f32 (Task 4) ───────────────────────────────────────────────────
+
+namespace {
+// Q6_K must map weight i to scale i/16 (16 scales per 256-weight super-block), matching ggml
+// dequantize_row_q6_K. Every 6-bit quant decodes to +1 (raw 33 = low nibble 1 | hi bits 2 << 4)
+// and scales = 0..16, so with x = 1 and d = 1 the dot is Σ_i scale[i/16] = 16·(0+…+15) = 1920.
+std::vector<uint8_t> canonical_q6_k_block() {
+    std::vector<uint8_t> block(Q6_K_BLOCK_BYTES, 0);
+    for (size_t i = 0; i < 128; ++i)
+        block[i] = 0x11; // every low nibble = 1
+    for (size_t i = 128; i < 192; ++i)
+        block[i] = 0xAA; // every 2-bit hi field = 0b10 = 2
+    for (size_t j = 0; j < 16; ++j)
+        block[192 + j] = static_cast<uint8_t>(j); // scales 0..15
+    sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(1.0f), block.data() + 208);
+    return block;
+}
+std::vector<uint8_t> rand_q6_k_block(uint64_t seed) {
+    auto blk = lcg_bytes(seed, Q6_K_BLOCK_BYTES);
+    sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.04f), blk.data() + 208);
+    return blk;
+}
+std::vector<uint8_t> rand_q5_k_block(uint64_t seed) {
+    auto blk = lcg_bytes(seed, Q5_K_BLOCK_BYTES);
+    sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.05f), blk.data());
+    sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.02f), blk.data() + 2);
+    return blk;
+}
+float q6_scale_of(const uint8_t* sc, size_t i) {
+    return static_cast<float>(detail::i8v(sc[i]));
+}
+// Buggy Q6_K dot: one scale per 32-element sub-group (the shipped bug — sc[ib..ib+4], ib += 4 per
+// 128-block), which only ever touches scales 0..7.
+float dot_q6_k_buggy(std::span<const uint8_t> row_data, std::span<const float> x) {
+    float acc = 0.0f;
+    size_t x_off = 0;
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = sapient::core::f16_le_to_f32(block + 208);
+        size_t ql_off = 0, qh_off = 0, ib = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (size_t l = 0; l < 32; ++l) {
+                const float q1 = static_cast<float>(
+                    static_cast<int32_t>((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) -
+                    32);
+                const float q2 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l + 32] & 0x0F) |
+                                                            (((qh[qh_off + l] >> 2) & 3) << 4)) -
+                                       32);
+                const float q3 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l] >> 4) |
+                                                            (((qh[qh_off + l] >> 4) & 3) << 4)) -
+                                       32);
+                const float q4 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l + 32] >> 4) |
+                                                            (((qh[qh_off + l] >> 6) & 3) << 4)) -
+                                       32);
+                acc += d * q6_scale_of(sc, ib) * q1 * x[x_off + l];
+                acc += d * q6_scale_of(sc, ib + 1) * q2 * x[x_off + l + 32];
+                acc += d * q6_scale_of(sc, ib + 2) * q3 * x[x_off + l + 64];
+                acc += d * q6_scale_of(sc, ib + 3) * q4 * x[x_off + l + 96];
+            }
+            x_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            ib += 4;
+        }
+    }
+    return acc;
+}
+// Buggy Q5_K dot: the 5th bit read from a single qh[is/8] byte per 32-element sub-block (the
+// shipped bug) instead of the per-element qh[l].
+float dot_q5_k_buggy(std::span<const uint8_t> row_data, std::span<const float> x) {
+    float acc = 0.0f;
+    size_t x_off = 0;
+    const size_t nb = row_data.size() / Q5_K_BLOCK_BYTES;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q5_K_BLOCK_BYTES;
+        const float d = sapient::core::f16_le_to_f32(block);
+        const float dmin = sapient::core::f16_le_to_f32(block + 2);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qh = block + 16;
+        const uint8_t* ql = block + 48;
+        size_t ql_off = 0, is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = sapient::core::dequant::get_scale_min_k4(is, scales);
+            const float d1 = d * static_cast<float>(sc1), m1v = dmin * static_cast<float>(m1);
+            const auto [sc2, m2] = sapient::core::dequant::get_scale_min_k4(is + 1, scales);
+            const float d2 = d * static_cast<float>(sc2), m2v = dmin * static_cast<float>(m2);
+            const uint8_t qh_byte = qh[is / 8]; // BUG: one byte for all 32 elements
+            for (size_t l = 0; l < 32; ++l) {
+                const float hi1 = (qh_byte & u1) != 0 ? 16.0f : 0.0f;
+                const float hi2 = (qh_byte & u2) != 0 ? 16.0f : 0.0f;
+                acc +=
+                    (d1 * (static_cast<float>(ql[ql_off + l] & 0x0F) + hi1) - m1v) * x[x_off + l];
+                acc += (d2 * (static_cast<float>(ql[ql_off + l] >> 4) + hi2) - m2v) *
+                       x[x_off + l + 32];
+            }
+            x_off += 64;
+            ql_off += 32;
+            is += 2;
+            if (is % 8 == 0) {
+                u1 = 1;
+                u2 = 2;
+            } else {
+                u1 = static_cast<uint8_t>(u1 << 2);
+                u2 = static_cast<uint8_t>(u2 << 2);
+            }
+        }
+    }
+    return acc;
+}
+float rel_err(float got, float reference) {
+    return ::fabsf(got - reference) / ::fmaxf(::fabsf(reference), 1e-6f);
+}
+struct Stats {
+    float mean, median, max;
+};
+Stats stats(std::vector<float>& v) {
+    std::sort(v.begin(), v.end());
+    float sum = -0.0f; // iter().sum::<f32>()
+    for (float x : v)
+        sum += x;
+    return {sum / static_cast<float>(v.size()), v[v.size() / 2], v.back()};
+}
+// quant.rs q6_k_test_rows: random bytes with a small positive f16 d at [208..210).
+std::vector<uint8_t> q6_k_test_rows(size_t n, size_t k, uint64_t seed) {
+    const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
+    std::vector<uint8_t> rows(n * row_bytes);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        switch (i % Q6_K_BLOCK_BYTES) {
+        case 208:
+            rows[i] = 0x11;
+            break;
+        case 209:
+            rows[i] = 0x2c;
+            break;
+        default:
+            rows[i] = static_cast<uint8_t>(lcg_step(seed) >> 33);
+        }
+    }
+    return rows;
+}
+} // namespace
+
+TEST(Quant, q6_k_scale_indexing_matches_ggml) {
+    const auto block = canonical_q6_k_block();
+    const std::vector<float> x(QK_K, 1.0f);
+    const float got = dot_q6_k_row_f32(block, x);
+    EXPECT_LT(::fabsf(got - 1920.0f), 1e-3f)
+        << "Q6_K scale indexing wrong: got " << got << ", expected 1920 (old buggy code gives 896)";
+}
+
+// Corruption-magnitude benchmark (differential-verification methodology): each reconstruction of
+// a historical silent-correctness bug is self-validated (Q6_K must reproduce the documented 896
+// on the canonical block) before its error distribution is printed. Assertions: the two
+// reconstruction fidelities; the rest is a report (run with --gtest_also_run_disabled_tests is
+// not needed — it always runs, like `cargo test -- --nocapture`).
+TEST(Quant, corruption_magnitude_report) {
+    const auto canon = canonical_q6_k_block();
+    const std::vector<float> xo(QK_K, 1.0f);
+    const float buggy_canon = dot_q6_k_buggy(canon, xo);
+    ASSERT_LT(::fabsf(buggy_canon - 896.0f), 1e-3f)
+        << "Q6_K bug reconstruction infidelity: got " << buggy_canon << ", expected documented 896";
+    const float correct_canon = dot_q6_k_row_f32(canon, xo);
+    std::printf(
+        "\n=== Corruption-magnitude benchmark (relative error vs verified reference) ===\n");
+    std::printf("[validate] Q6_K canonical block: correct=%g buggy=%g rel_err=%.4f\n",
+                correct_canon,
+                buggy_canon,
+                rel_err(buggy_canon, correct_canon));
+
+    const size_t nblk = 256;
+    std::vector<float> q6(nblk);
+    for (size_t i = 0; i < nblk; ++i) {
+        const auto blk = rand_q6_k_block(0xC0DE0000ULL + i);
+        const auto x = rand_x(0xBEEF0000ULL + i, QK_K);
+        q6[i] = rel_err(dot_q6_k_buggy(blk, x), dot_q6_k_row_f32(blk, x));
+    }
+    const Stats s6 = stats(q6);
+    std::printf("Q6_K scale mis-index   (n=%zu): mean=%.3f median=%.3f max=%.3f\n",
+                nblk,
+                s6.mean,
+                s6.median,
+                s6.max);
+
+    std::vector<float> q5(nblk);
+    for (size_t i = 0; i < nblk; ++i) {
+        const auto blk = rand_q5_k_block(0x5A5A0000ULL + i);
+        const auto x = rand_x(0x13570000ULL + i, QK_K);
+        q5[i] = rel_err(dot_q5_k_buggy(blk, x), dot_q5_k_row_f32(blk, x));
+    }
+    const Stats s5 = stats(q5);
+    std::printf("Q5_K 5th-bit mis-index (n=%zu): mean=%.3f median=%.3f max=%.3f\n",
+                nblk,
+                s5.mean,
+                s5.median,
+                s5.max);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (has_dotprod()) {
+        const size_t k = 4096;
+        const auto wf = rand_x(0xAAAA, k);
+        const auto w_blocks = q8_0_weight_row(wf);
+        std::printf("Activation quant (Q8_0 W8A8, K=%zu):  outlier   per-block   per-row\n", k);
+        for (const float mag : {1.0f, 5.0f, 10.0f, 20.0f, 40.0f, 80.0f}) {
+            auto xf = rand_x(0xBBBB, k);
+            xf[k / 2] = mag; // single outlier channel
+            const float reference = dot_q8_0_row_f32(w_blocks, xf);
+            const auto xq = quantize_row_to_i8_blocks(xf);
+            const float block = dot_q8_0_row_sdot(w_blocks, xq.q, xq.scales);
+            float max_abs = 0.0f;
+            for (float v : xf)
+                max_abs = ::fmaxf(max_abs, ::fabsf(v));
+            const float rs = max_abs / 127.0f;
+            const float inv = 1.0f / rs;
+            std::vector<int8_t> x_row(k);
+            for (size_t i = 0; i < k; ++i)
+                x_row[i] = detail::round_clamp_i8(xf[i] * inv);
+            const std::vector<float> perrow_sc(k / QK, rs);
+            const float perrow = dot_q8_0_row_sdot(w_blocks, x_row, perrow_sc);
+            std::printf("  %5.0fx outlier:                %10.4f %10.4f\n",
+                        static_cast<double>(mag),
+                        static_cast<double>(rel_err(block, reference)),
+                        static_cast<double>(rel_err(perrow, reference)));
+        }
+    }
+#endif
+    std::printf("===========================================================================\n\n");
+}
+
+TEST(Quant, q6_k_neon_matches_scalar) {
+    // The vectorised Q6_K dot must equal the scalar reference (same f32 math, only reduction
+    // order differs). A bit-layout/scale bug here = token-salad.
+    uint64_t seed = 0x51EDC0DEULL;
+    auto next = [&seed]() { return static_cast<uint32_t>(lcg_step(seed) >> 33); };
+    const size_t nblocks = 3;
+    std::vector<uint8_t> row(nblocks * Q6_K_BLOCK_BYTES);
+    for (uint8_t& b : row)
+        b = static_cast<uint8_t>(next() & 0xFF);
+    for (size_t blk = 0; blk < nblocks; ++blk)
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.04f),
+                                 row.data() + blk * Q6_K_BLOCK_BYTES + 208);
+    std::vector<float> x(nblocks * QK_K);
+    for (float& v : x)
+        v = (static_cast<float>(next()) /
+             static_cast<float>(std::numeric_limits<uint32_t>::max())) *
+                3.0f -
+            1.5f;
+    const float scalar = detail::dot_q6_k_row_f32_scalar(row, x);
+    const float got = dot_q6_k_row_f32(row, x); // dispatches to NEON on aarch64
+    const float rel = ::fabsf(got - scalar) / ::fmaxf(::fabsf(scalar), 1e-3f);
+    EXPECT_LT(rel, 1e-4f) << "Q6_K NEON≠scalar: neon=" << got << " scalar=" << scalar;
+}
+
+TEST(Quant, q5_k_neon_matches_scalar) {
+    uint64_t seed = 0xA5A51234ULL;
+    auto next = [&seed]() { return static_cast<uint32_t>(lcg_step(seed) >> 33); };
+    const size_t nblocks = 3;
+    std::vector<uint8_t> row(nblocks * Q5_K_BLOCK_BYTES);
+    for (uint8_t& b : row)
+        b = static_cast<uint8_t>(next() & 0xFF);
+    for (size_t blk = 0; blk < nblocks; ++blk) {
+        uint8_t* base = row.data() + blk * Q5_K_BLOCK_BYTES;
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.05f), base);
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.02f), base + 2);
+    }
+    std::vector<float> x(nblocks * QK_K);
+    for (float& v : x)
+        v = (static_cast<float>(next()) /
+             static_cast<float>(std::numeric_limits<uint32_t>::max())) *
+                3.0f -
+            1.5f;
+    const float scalar = detail::dot_q5_k_row_f32_scalar(row, x);
+    const float got = dot_q5_k_row_f32(row, x);
+    const float rel = ::fabsf(got - scalar) / ::fmaxf(::fabsf(scalar), 1e-3f);
+    EXPECT_LT(rel, 1e-4f) << "Q5_K NEON≠scalar: neon=" << got << " scalar=" << scalar;
+}
+
+TEST(Quant, q6_k_r4_repack_roundtrips_through_dequant) {
+    using sapient::core::DType;
+    using sapient::core::Shape;
+    using sapient::core::Tensor;
+    const size_t n = 8, k = 512;
+    const auto blocks = q6_k_test_rows(n, k, 0x6B6BULL);
+    auto orig = Tensor::from_quant_bytes(blocks, Shape{n, k}, DType::Q6_K);
+    ASSERT_TRUE(orig.has_value()) << orig.error().to_string();
+    const auto packed = repack_q6_k_rows4(blocks, n, k);
+    auto r4 = Tensor::from_quant_bytes(packed, Shape{n, k}, DType::Q6_K_R4);
+    ASSERT_TRUE(r4.has_value()) << r4.error().to_string();
+    EXPECT_EQ(orig->to_f32_vec(), r4->to_f32_vec());
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q6_k_r4_kernel_matches_single_row) {
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / 256 * Q6_K_BLOCK_BYTES;
+    const auto blocks = q6_k_test_rows(n, k, 0x6666ULL);
+    const auto x = ramp(k, 41, 83, 41.0f, 0.02f);
+    const auto packed = repack_q6_k_rows4(blocks, n, k);
+    const auto got = dot_q6_k_4rows_r4_neon(packed, x);
+    for (size_t r = 0; r < 4; ++r) {
+        const float want = detail::dot_q6_k_row_f32_neon(row_of(blocks, r, row_bytes), x);
+        EXPECT_EQ(bits(got[r]), bits(want)) << "row " << r << ": " << got[r] << " vs " << want;
+    }
+}
+#endif
+
+TEST(QuantDeath, repack_q6_k_rows4_asserts_like_rust) {
+    const std::vector<uint8_t> two_rows(2 * Q6_K_BLOCK_BYTES, 0);
+    EXPECT_DEATH((void)repack_q6_k_rows4(two_rows, 2, 256), "multiple of 4");
 }
 #endif

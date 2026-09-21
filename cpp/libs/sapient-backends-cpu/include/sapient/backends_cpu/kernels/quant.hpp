@@ -197,7 +197,36 @@ dot_q4_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
                                std::span<const int32_t> x1_sums);
 #endif
 
-// ── Q5_K, Q6_K f32, Q6_K repack/R4 f32 (Task 4) ─────────────────────────────────
+// ── Q5_K ────────────────────────────────────────────────────────────────────────
+// Block: [0..2) d | [2..4) dmin | [4..16) scales | [16..48) qh (per-ELEMENT 5th bits, bit-plane
+// selected by u1/u2) | [48..176) ql nibbles.
+/// Row · f32 activations (NEON on aarch64, scalar elsewhere). No int8 variant exists (Rust has none).
+float dot_q5_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x);
+
+// ── Q6_K ────────────────────────────────────────────────────────────────────────
+// Block: [0..128) ql | [128..192) qh (two 2-bit fields per byte) | [192..208) 16 SIGNED i8 scales,
+// one per 16 weights (offsets +0/+2/+4/+6 within a 128-half, `is = l/16`, base +8 per half — the
+// historical token-salad bug) | [208..210) d f16.
+/// Row · f32 activations (NEON on aarch64, scalar elsewhere).
+float dot_q6_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x);
+/// Repack `n` Q6_K rows into the Q6_K_R4 layout (same 4-row block-major interleave as Q4_K_R4,
+/// over 210-byte blocks). Same panics as `repack_q4_k_rows4`.
+std::vector<uint8_t> repack_q6_k_rows4(std::span<const uint8_t> blocks, size_t n, size_t k);
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// Four R4 Q6_K rows against one f32 activation vector (plain NEON; the decode path when dotprod
+/// is absent); each lane bit-identical to `detail::dot_q6_k_row_f32_neon`.
+std::array<float, 4> dot_q6_k_4rows_r4_neon(std::span<const uint8_t> packed,
+                                            std::span<const float> x);
+#endif
+namespace detail {
+float dot_q5_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x);
+float dot_q6_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x);
+#if defined(__aarch64__) || defined(_M_ARM64)
+float dot_q5_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x);
+float dot_q6_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x);
+#endif
+} // namespace detail
+
 // ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ───────────────────────────────────────────
 
 } // namespace sapient::backends_cpu::kernels::quant

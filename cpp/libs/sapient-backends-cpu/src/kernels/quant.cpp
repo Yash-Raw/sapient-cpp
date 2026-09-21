@@ -1349,6 +1349,348 @@ dot_q4_k_4rows_r4_x2_q8k_smmla(std::span<const uint8_t> packed,
 }
 #endif
 
-// ── Q5_K, Q6_K f32, Q6_K repack/R4 f32 (Task 4) ──────────────────────────────
+// ── Q5_K (quant.rs:1617-1755) ────────────────────────────────────────────────
+
+float detail::dot_q5_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q5_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q5_k_row_f32: x shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q5_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qh = block + 16;
+        const uint8_t* ql = block + 48;
+        size_t ql_off = 0;
+        size_t is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+            // The 5th bit is PER-ELEMENT: ggml reads qh[l] (l = 0..32) and selects the active
+            // bit-plane with u1/u2 (which shift by 2 each sub-block pair).
+            for (size_t l = 0; l < 32; ++l) {
+                const float hi1 = (qh[l] & u1) != 0 ? 16.0f : 0.0f;
+                const float hi2 = (qh[l] & u2) != 0 ? 16.0f : 0.0f;
+                acc +=
+                    (d1 * (static_cast<float>(ql[ql_off + l] & 0x0F) + hi1) - m1v) * x[x_off + l];
+                acc += (d2 * (static_cast<float>(ql[ql_off + l] >> 4) + hi2) - m2v) *
+                       x[x_off + l + 32];
+            }
+            x_off += 64;
+            ql_off += 32;
+            is += 2;
+            if (is % 8 == 0) {
+                u1 = 1;
+                u2 = 2;
+            } else {
+                u1 = static_cast<uint8_t>(u1 << 2);
+                u2 = static_cast<uint8_t>(u2 << 2);
+            }
+        }
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+namespace {
+// Widen 16 u8 lanes to four f32x4 (`vf` of the Rust accum! macros).
+inline void widen_u8x16_to_f32x4x4(uint8x16_t v, float32x4_t out[4]) {
+    const uint16x8_t v16lo = vmovl_u8(vget_low_u8(v));
+    const uint16x8_t v16hi = vmovl_high_u8(v);
+    out[0] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(v16lo)));
+    out[1] = vcvtq_f32_u32(vmovl_high_u16(v16lo));
+    out[2] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(v16hi)));
+    out[3] = vcvtq_f32_u32(vmovl_high_u16(v16hi));
+}
+// Q5_K accum!: acc += (d·val − m)·x over 16 lanes (4× f32x4).
+inline float32x4_t q5_accum(float32x4_t acc, uint8x16_t val, float dd, float mm, const float* xb) {
+    float32x4_t vf[4];
+    widen_u8x16_to_f32x4x4(val, vf);
+    const float32x4_t mneg = vdupq_n_f32(mm);
+    for (size_t c = 0; c < 4; ++c) {
+        const float32x4_t t = vsubq_f32(vmulq_n_f32(vf[c], dd), mneg);
+        const float32x4_t xc = vld1q_f32(xb + c * 4);
+        acc = vfmaq_f32(acc, t, xc);
+    }
+    return acc;
+}
+} // namespace
+
+// NEON Q5_K row dot — the (fixed) scalar reference 16 lanes at a time; ONE accumulator across the
+// whole row, reduced once at the end (quant.rs:1678-1755).
+float detail::dot_q5_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q5_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q5_k_row_f32: x shorter than the row");
+    const uint8x16_t mask0f = vdupq_n_u8(0x0F);
+    const uint8x16_t sixteen = vdupq_n_u8(16);
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q5_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qh = block + 16;
+        const uint8_t* ql = block + 48;
+        size_t ql_off = 0;
+        size_t is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+            const uint8x16_t u1v = vdupq_n_u8(u1);
+            const uint8x16_t u2v = vdupq_n_u8(u2);
+            for (const size_t half : {size_t{0}, size_t{16}}) {
+                const uint8x16_t qlv = vld1q_u8(ql + ql_off + half);
+                const uint8x16_t qhv = vld1q_u8(qh + half);
+                // 5th bit → 16 or 0 (per element): (qh & u) ? 16 : 0.
+                const uint8x16_t hi1 = vandq_u8(vtstq_u8(qhv, u1v), sixteen);
+                const uint8x16_t hi2 = vandq_u8(vtstq_u8(qhv, u2v), sixteen);
+                const uint8x16_t val_lo = vaddq_u8(vandq_u8(qlv, mask0f), hi1); // 0..31
+                const uint8x16_t val_hi = vaddq_u8(vshrq_n_u8(qlv, 4), hi2);
+                acc = q5_accum(acc, val_lo, d1, m1v, x.data() + x_off + half);
+                acc = q5_accum(acc, val_hi, d2, m2v, x.data() + x_off + 32 + half);
+            }
+            x_off += 64;
+            ql_off += 32;
+            is += 2;
+            if (is % 8 == 0) {
+                u1 = 1;
+                u2 = 2;
+            } else {
+                u1 = static_cast<uint8_t>(u1 << 2);
+                u2 = static_cast<uint8_t>(u2 << 2);
+            }
+        }
+    }
+    return vaddvq_f32(acc);
+}
+#endif
+
+float dot_q5_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x) {
+#if SAPIENT_AARCH64
+    return detail::dot_q5_k_row_f32_neon(row_data, x);
+#else
+    return detail::dot_q5_k_row_f32_scalar(row_data, x);
+#endif
+}
+
+// ── Q6_K f32, repack, R4 f32 (quant.rs:2000-2018, 2208-2313, 2564-2710) ─────
+
+namespace {
+// `sc[i] as i8 as f32`.
+inline float q6_scale(const uint8_t* sc, size_t i) {
+    return static_cast<float>(detail::i8v(sc[i]));
+}
+#if SAPIENT_AARCH64
+// The four 6-bit sub-positions of one 16-lane group (each 16× u8 in [0,63]) — shared by every
+// NEON Q6_K kernel (quant.rs:2637-2652 and its five copies).
+inline void q6_unpack(const uint8_t* ql,
+                      const uint8_t* qh,
+                      size_t ql_off,
+                      size_t qh_off,
+                      size_t l0,
+                      uint8x16_t q[4]) {
+    const uint8x16_t mask0f = vdupq_n_u8(0x0F);
+    const uint8x16_t mask3 = vdupq_n_u8(0x03);
+    const uint8x16_t ql_lo = vld1q_u8(ql + ql_off + l0);
+    const uint8x16_t ql_hi = vld1q_u8(ql + ql_off + l0 + 32);
+    const uint8x16_t qhv = vld1q_u8(qh + qh_off + l0);
+    q[0] = vorrq_u8(vandq_u8(ql_lo, mask0f), vshlq_n_u8(vandq_u8(qhv, mask3), 4));
+    q[1] = vorrq_u8(vandq_u8(ql_hi, mask0f), vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv, 2), mask3), 4));
+    q[2] = vorrq_u8(vshrq_n_u8(ql_lo, 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv, 4), mask3), 4));
+    q[3] = vorrq_u8(vshrq_n_u8(ql_hi, 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv, 6), mask3), 4));
+}
+// Q6_K f32 accum!: acc += scale · Σ_lane (q − 32) · x over 16 lanes (4× f32x4).
+inline float32x4_t q6_accum_f32(float32x4_t acc, uint8x16_t q, float scale, const float* xb) {
+    float32x4_t qf[4];
+    widen_u8x16_to_f32x4x4(q, qf);
+    const float32x4_t m32 = vdupq_n_f32(32.0f);
+    const float32x4_t sv = vdupq_n_f32(scale);
+    for (size_t c = 0; c < 4; ++c) {
+        const float32x4_t qm = vsubq_f32(qf[c], m32);
+        const float32x4_t xc = vld1q_f32(xb + c * 4);
+        acc = vfmaq_f32(acc, vmulq_f32(qm, sv), xc);
+    }
+    return acc;
+}
+#endif
+} // namespace
+
+float detail::dot_q6_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q6_k_row_f32: x shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        // 16 i8 scales per super-block (one per 16-element group): within each 128-element half
+        // the 4 sub-groups use offsets +0/+2/+4/+6, split again at l==16 (`is = l/16`), base +8
+        // per 128-block (ggml dequantize_row_q6_K).
+        size_t sc_base = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (size_t l = 0; l < 32; ++l) {
+                const size_t is = l / 16;
+                const float q1 = static_cast<float>(
+                    static_cast<int32_t>((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) -
+                    32);
+                const float q2 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l + 32] & 0x0F) |
+                                                            (((qh[qh_off + l] >> 2) & 3) << 4)) -
+                                       32);
+                const float q3 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l] >> 4) |
+                                                            (((qh[qh_off + l] >> 4) & 3) << 4)) -
+                                       32);
+                const float q4 =
+                    static_cast<float>(static_cast<int32_t>((ql[ql_off + l + 32] >> 4) |
+                                                            (((qh[qh_off + l] >> 6) & 3) << 4)) -
+                                       32);
+                acc += d * q6_scale(sc, sc_base + is) * q1 * x[x_off + l];
+                acc += d * q6_scale(sc, sc_base + is + 2) * q2 * x[x_off + l + 32];
+                acc += d * q6_scale(sc, sc_base + is + 4) * q3 * x[x_off + l + 64];
+                acc += d * q6_scale(sc, sc_base + is + 6) * q4 * x[x_off + l + 96];
+            }
+            x_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+// NEON Q6_K row dot — the scalar reference 16 lanes at a time, ONE accumulator across the whole
+// row (quant.rs:2623-2710). Same `sc_base + is + {0,2,4,6}` scale layout as the scalar.
+float detail::dot_q6_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q6_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q6_k_row_f32: x shorter than the row");
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q6_K_BLOCK_BYTES;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const uint8_t* sc = block + 192;
+        const float d = f16_le_to_f32(block + 208);
+        size_t ql_off = 0;
+        size_t qh_off = 0;
+        size_t sc_base = 0;
+        for (size_t half = 0; half < QK_K / 128; ++half) {
+            for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                const size_t is = l0 / 16;
+                uint8x16_t q[4];
+                q6_unpack(ql, qh, ql_off, qh_off, l0, q);
+                const float s1 = d * q6_scale(sc, sc_base + is);
+                const float s2 = d * q6_scale(sc, sc_base + is + 2);
+                const float s3 = d * q6_scale(sc, sc_base + is + 4);
+                const float s4 = d * q6_scale(sc, sc_base + is + 6);
+                acc = q6_accum_f32(acc, q[0], s1, x.data() + x_off + l0);
+                acc = q6_accum_f32(acc, q[1], s2, x.data() + x_off + 32 + l0);
+                acc = q6_accum_f32(acc, q[2], s3, x.data() + x_off + 64 + l0);
+                acc = q6_accum_f32(acc, q[3], s4, x.data() + x_off + 96 + l0);
+            }
+            x_off += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_base += 8;
+        }
+    }
+    return vaddvq_f32(acc);
+}
+
+// Four R4 Q6_K rows × one f32 activation vector: one packed stream per row-group; per-row math
+// identical to dot_q6_k_row_f32_neon, four accumulators carried across blocks (quant.rs:2208-2313).
+std::array<float, 4> dot_q6_k_4rows_r4_neon(std::span<const uint8_t> packed,
+                                            std::span<const float> x) {
+    const size_t nb = packed.size() / (4 * Q6_K_BLOCK_BYTES);
+    check_len(x.size(), nb * QK_K, "dot_q6_k_4rows_r4_neon: x shorter than the row");
+    float32x4_t accv[4] = {
+        vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t gbase = b * 4 * Q6_K_BLOCK_BYTES;
+        for (size_t r = 0; r < 4; ++r) {
+            const uint8_t* block = packed.data() + gbase + r * Q6_K_BLOCK_BYTES;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const uint8_t* sc = block + 192;
+            const float d = f16_le_to_f32(block + 208);
+            float32x4_t acc = accv[r];
+            size_t xo = x_off;
+            size_t ql_off = 0;
+            size_t qh_off = 0;
+            size_t sc_base = 0;
+            for (size_t half = 0; half < QK_K / 128; ++half) {
+                for (const size_t l0 : {size_t{0}, size_t{16}}) {
+                    const size_t is = l0 / 16;
+                    uint8x16_t q[4];
+                    q6_unpack(ql, qh, ql_off, qh_off, l0, q);
+                    const float s1 = d * q6_scale(sc, sc_base + is);
+                    const float s2 = d * q6_scale(sc, sc_base + is + 2);
+                    const float s3 = d * q6_scale(sc, sc_base + is + 4);
+                    const float s4 = d * q6_scale(sc, sc_base + is + 6);
+                    acc = q6_accum_f32(acc, q[0], s1, x.data() + xo + l0);
+                    acc = q6_accum_f32(acc, q[1], s2, x.data() + xo + 32 + l0);
+                    acc = q6_accum_f32(acc, q[2], s3, x.data() + xo + 64 + l0);
+                    acc = q6_accum_f32(acc, q[3], s4, x.data() + xo + 96 + l0);
+                }
+                xo += 128;
+                ql_off += 64;
+                qh_off += 32;
+                sc_base += 8;
+            }
+            accv[r] = acc;
+        }
+        x_off += QK_K;
+    }
+    return {vaddvq_f32(accv[0]), vaddvq_f32(accv[1]), vaddvq_f32(accv[2]), vaddvq_f32(accv[3])};
+}
+#endif
+
+float dot_q6_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x) {
+#if SAPIENT_AARCH64
+    return detail::dot_q6_k_row_f32_neon(row_data, x);
+#else
+    return detail::dot_q6_k_row_f32_scalar(row_data, x);
+#endif
+}
+
+std::vector<uint8_t> repack_q6_k_rows4(std::span<const uint8_t> blocks, size_t n, size_t k) {
+    if (n % 4 != 0) panic("Q6_K_R4 repack: rows must be a multiple of 4");
+    if (k % QK_K != 0) panic("Q6_K_R4 repack: k must be a multiple of 256");
+    const size_t nb = k / QK_K;
+    const size_t row_bytes = nb * Q6_K_BLOCK_BYTES;
+    if (blocks.size() != n * row_bytes) panic("Q6_K_R4 repack: blocks.len() != n * row_bytes");
+    std::vector<uint8_t> out(blocks.size(), 0);
+    for (size_t g = 0; g < n / 4; ++g)
+        for (size_t b = 0; b < nb; ++b)
+            for (size_t r = 0; r < 4; ++r) {
+                const size_t src = ((g * 4 + r) * nb + b) * Q6_K_BLOCK_BYTES;
+                const size_t dst = (g * 4 * nb + b * 4 + r) * Q6_K_BLOCK_BYTES;
+                std::copy_n(blocks.data() + src, Q6_K_BLOCK_BYTES, out.data() + dst);
+            }
+    return out;
+}
+
+// ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ────────────────────────────────────
 
 } // namespace sapient::backends_cpu::kernels::quant
