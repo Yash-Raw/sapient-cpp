@@ -109,7 +109,48 @@ float dot_q8_0_row_avx2(std::span<const uint8_t> row_blocks, std::span<const flo
 #endif
 } // namespace detail
 
-// ── Q4_K (Task 2) ───────────────────────────────────────────────────────────────
+// ── Q4_K ────────────────────────────────────────────────────────────────────────
+// Block: [0..2) d f16 | [2..4) dmin f16 | [4..16) 12 packed 6-bit (scale,min) pairs | [16..144) 128
+// nibble bytes. Per 64-weight group g: lo nibbles ↔ x[64g..64g+32) with (sc,m) pair 2g, hi nibbles
+// ↔ x[64g+32..64g+64) with pair 2g+1.
+/// Row · f32 activations (NEON on aarch64, scalar elsewhere).
+float dot_q4_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x);
+/// W4A8: row · per-32 int8 activations; `x_sums` = `i8_block_sums(x_i8)` (precomputed, never
+/// re-reduced). Scalar reference for the SDOT kernels (same integer dot, same f32 combine order).
+float dot_q4_k_row_q8_scalar(std::span<const uint8_t> row_data,
+                             std::span<const int8_t> x_i8,
+                             std::span<const float> x_scales,
+                             std::span<const int32_t> x_sums);
+/// Repack `n` Q4_K rows into the Q4_K_R4 layout: groups of 4 rows, super-blocks block-major within
+/// the group (`[r0.b0, r1.b0, r2.b0, r3.b0, r0.b1, …]`). Panics unless `n % 4 == 0`, `k % 256 == 0`
+/// and `blocks.size() == n · k/256 · 144`.
+std::vector<uint8_t> repack_q4_k_rows4(std::span<const uint8_t> blocks, size_t n, size_t k);
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// NEON W4A8 row dot via `sdot`; bit-identical to `dot_q4_k_row_q8_scalar`. Precondition: dotprod.
+float dot_q4_k_row_q8_neon(std::span<const uint8_t> row_data,
+                           std::span<const int8_t> x_i8,
+                           std::span<const float> x_scales,
+                           std::span<const int32_t> x_sums);
+/// Four row-major Q4_K rows against ONE int8 activation row (activations loaded once per 64-weight
+/// group); each lane bit-identical to `dot_q4_k_row_q8_neon`. Precondition: dotprod.
+std::array<float, 4> dot_q4_k_4rows_q8_neon(std::array<std::span<const uint8_t>, 4> rows,
+                                            std::span<const int8_t> x_i8,
+                                            std::span<const float> x_scales,
+                                            std::span<const int32_t> x_sums);
+/// Four Q4_K rows in the R4 layout (`packed` = one whole row-group) against one int8 activation
+/// row; each lane bit-identical to `dot_q4_k_row_q8_neon`. Precondition: dotprod.
+std::array<float, 4> dot_q4_k_4rows_r4_neon(std::span<const uint8_t> packed,
+                                            std::span<const int8_t> x_i8,
+                                            std::span<const float> x_scales,
+                                            std::span<const int32_t> x_sums);
+#endif
+namespace detail {
+float dot_q4_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x);
+#if defined(__aarch64__) || defined(_M_ARM64)
+float dot_q4_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x);
+#endif
+} // namespace detail
+
 // ── Q4_K × Q8_K, SMMLA (Task 3) ─────────────────────────────────────────────────
 // ── Q5_K, Q6_K f32, Q6_K repack/R4 f32 (Task 4) ─────────────────────────────────
 // ── Q6_K W6A8 / Q8_K / SMMLA (Task 5) ───────────────────────────────────────────

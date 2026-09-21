@@ -20,7 +20,10 @@
 
 #include "sapient/backends_cpu/cpu_features.hpp"
 #include "sapient/backends_cpu/kernels/quant.hpp"
+#include "sapient/core/dtype.hpp"
 #include "sapient/core/f16.hpp"
+#include "sapient/core/shape.hpp"
+#include "sapient/core/tensor.hpp"
 
 using namespace sapient::backends_cpu::kernels::quant;
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -280,4 +283,147 @@ TEST(QuantDeath, block_quantizers_panic_on_wrong_length) {
     EXPECT_DEATH((void)quantize_q4_0_block(x), "");
     const std::vector<float> x33(33, 0.0f);
     EXPECT_DEATH((void)quantize_row_to_i8_blocks(x33), "");
+}
+
+// ── Q4_K (Task 2) ────────────────────────────────────────────────────────────
+
+namespace {
+// quant.rs: 8 pseudo-random Q4_K rows with SMALL positive f16 d/dmin (bytes 0x11,0x2c) so the
+// magnitudes stay sane; the LCG only advances on non-header bytes (the `_ => nb()` arm).
+std::vector<uint8_t> q4_k_test_rows(size_t n, size_t k, uint64_t seed) {
+    const size_t row_bytes = k / 256 * Q4_K_BLOCK_BYTES;
+    std::vector<uint8_t> rows(n * row_bytes);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        switch (i % Q4_K_BLOCK_BYTES) {
+        case 0:
+        case 2:
+            rows[i] = 0x11;
+            break;
+        case 1:
+        case 3:
+            rows[i] = 0x2c;
+            break;
+        default:
+            rows[i] = static_cast<uint8_t>(lcg_step(seed) >> 33);
+        }
+    }
+    return rows;
+}
+std::vector<float> ramp(size_t k, size_t mul, size_t mod, float sub, float step) {
+    std::vector<float> x(k);
+    for (size_t i = 0; i < k; ++i)
+        x[i] = (static_cast<float>(i * mul % mod) - sub) * step;
+    return x;
+}
+std::span<const uint8_t> row_of(const std::vector<uint8_t>& rows, size_t r, size_t row_bytes) {
+    return std::span<const uint8_t>(rows).subspan(r * row_bytes, row_bytes);
+}
+} // namespace
+
+TEST(Quant, q4_k_w4a8_matches_f32_path) {
+    // The W4A8 (int8-activation) Q4_K dot must agree with the proven f32 path within
+    // activation-quantization error. A layout/scale bug (the kind that produced Q6_K salad) shows
+    // up as a wildly-wrong result, not a few %.
+    uint64_t seed = 0x12345678ULL;
+    auto next = [&seed]() { return static_cast<uint32_t>(lcg_step(seed) >> 33); };
+    const size_t nblocks = 2; // 512 weights → 16 activation blocks of 32
+    std::vector<uint8_t> row(nblocks * Q4_K_BLOCK_BYTES, 0);
+    for (size_t b = 0; b < nblocks; ++b) {
+        uint8_t* blk = row.data() + b * Q4_K_BLOCK_BYTES;
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.05f), blk);      // d
+        sapient::core::f16_to_le(sapient::core::f32_to_f16_bits(0.018f), blk + 2); // dmin
+        for (size_t i = 4; i < Q4_K_BLOCK_BYTES; ++i)
+            blk[i] = static_cast<uint8_t>(next() & 0xFF); // scales + packed nibbles
+    }
+    std::vector<float> x(nblocks * QK_K);
+    for (float& v : x)
+        v = (static_cast<float>(next()) /
+             static_cast<float>(std::numeric_limits<uint32_t>::max())) *
+                4.0f -
+            2.0f;
+
+    const float f32_dot = dot_q4_k_row_f32(row, x);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    const auto xsums = i8_block_sums(xq.q);
+    const float q8_dot = dot_q4_k_row_q8_scalar(row, xq.q, xq.scales, xsums);
+    const float rel = ::fabsf(f32_dot - q8_dot) / ::fmaxf(::fabsf(f32_dot), 1e-3f);
+    EXPECT_LT(rel, 0.03f) << "W4A8 mismatch: f32=" << f32_dot << " q8=" << q8_dot;
+
+    // The NEON SDOT kernel must match the scalar W4A8 reference exactly (same integer dot; only
+    // f32 reduction order differs → tiny tolerance).
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (has_dotprod()) {
+        const float neon = dot_q4_k_row_q8_neon(row, xq.q, xq.scales, xsums);
+        const float rel_n = ::fabsf(neon - q8_dot) / ::fmaxf(::fabsf(q8_dot), 1e-3f);
+        EXPECT_LT(rel_n, 1e-4f) << "NEON≠scalar W4A8: neon=" << neon << " scalar=" << q8_dot;
+    }
+#endif
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q4_k_4rows_matches_single_row) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t k = 512;
+    const size_t row_bytes = k / 256 * Q4_K_BLOCK_BYTES;
+    const auto rows = q4_k_test_rows(8, k, 0x5EEDULL);
+    const auto x = ramp(k, 37, 97, 48.0f, 0.02f);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    const auto x_sums = i8_block_sums(xq.q);
+    for (size_t group = 0; group < 2; ++group) {
+        const size_t j = group * 4;
+        const std::array<std::span<const uint8_t>, 4> r4 = {row_of(rows, j, row_bytes),
+                                                            row_of(rows, j + 1, row_bytes),
+                                                            row_of(rows, j + 2, row_bytes),
+                                                            row_of(rows, j + 3, row_bytes)};
+        const auto got = dot_q4_k_4rows_q8_neon(r4, xq.q, xq.scales, x_sums);
+        for (size_t o = 0; o < 4; ++o) {
+            const float want = dot_q4_k_row_q8_neon(r4[o], xq.q, xq.scales, x_sums);
+            EXPECT_EQ(bits(got[o]), bits(want))
+                << "row " << j + o << " differs: " << got[o] << " vs " << want;
+        }
+    }
+}
+#endif
+
+TEST(Quant, q4_k_r4_repack_roundtrips_through_dequant) {
+    // to_f32_vec on a repacked tensor must equal to_f32_vec on the original (the de-interleave
+    // map is the inverse of the repack permutation).
+    using sapient::core::DType;
+    using sapient::core::Shape;
+    using sapient::core::Tensor;
+    const size_t n = 8, k = 512;
+    const auto blocks = q4_k_test_rows(n, k, 0x00D5ULL);
+    auto orig = Tensor::from_quant_bytes(blocks, Shape{n, k}, DType::Q4_K);
+    ASSERT_TRUE(orig.has_value()) << orig.error().to_string();
+    const auto packed = repack_q4_k_rows4(blocks, n, k);
+    auto r4 = Tensor::from_quant_bytes(packed, Shape{n, k}, DType::Q4_K_R4);
+    ASSERT_TRUE(r4.has_value()) << r4.error().to_string();
+    EXPECT_EQ(orig->to_f32_vec(), r4->to_f32_vec());
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(Quant, q4_k_r4_kernel_matches_single_row) {
+    if (!has_dotprod()) GTEST_SKIP() << "dotprod not available";
+    const size_t n = 4, k = 512;
+    const size_t row_bytes = k / 256 * Q4_K_BLOCK_BYTES;
+    const auto blocks = q4_k_test_rows(n, k, 0x0B0BULL);
+    const auto x = ramp(k, 53, 89, 44.0f, 0.02f);
+    const auto xq = quantize_row_to_i8_blocks(x);
+    const auto x_sums = i8_block_sums(xq.q);
+    const auto packed = repack_q4_k_rows4(blocks, n, k);
+    const auto got = dot_q4_k_4rows_r4_neon(packed, xq.q, xq.scales, x_sums);
+    for (size_t r = 0; r < 4; ++r) {
+        const float want =
+            dot_q4_k_row_q8_neon(row_of(blocks, r, row_bytes), xq.q, xq.scales, x_sums);
+        EXPECT_EQ(bits(got[r]), bits(want)) << "row " << r << ": " << got[r] << " vs " << want;
+    }
+}
+#endif
+
+TEST(QuantDeath, repack_q4_k_rows4_asserts_like_rust) {
+    const std::vector<uint8_t> two_rows(2 * Q4_K_BLOCK_BYTES, 0);
+    EXPECT_DEATH((void)repack_q4_k_rows4(two_rows, 2, 256), "multiple of 4");
+    const std::vector<uint8_t> four_rows(4 * Q4_K_BLOCK_BYTES, 0);
+    EXPECT_DEATH((void)repack_q4_k_rows4(four_rows, 4, 200), "");
+    EXPECT_DEATH((void)repack_q4_k_rows4(two_rows, 4, 256), ""); // blocks.len() != n * row_bytes
 }

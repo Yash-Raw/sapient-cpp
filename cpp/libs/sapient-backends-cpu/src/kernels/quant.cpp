@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <utility>
 #include <vector>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -428,6 +429,421 @@ float dot_q8_0_row_f32(std::span<const uint8_t> row_blocks, std::span<const floa
     return acc;
 }
 
-// ── K-quants: Q4_K (Task 2) ──────────────────────────────────────────────────
+// ── K-quants: Q4_K (quant.rs:588-1330) ───────────────────────────────────────
+
+namespace {
+
+using sapient::core::dequant::get_scale_min_k4;
+
+// (d, dmin) of a Q4_K/Q5_K super-block header.
+std::pair<float, float> q4k_header(const uint8_t* block) {
+    return {f16_le_to_f32(block), f16_le_to_f32(block + 2)};
+}
+
+// Entry checks for the activation-side spans of a K-quant row of `nb` super-blocks.
+void check_q8_row(size_t nb,
+                  std::span<const int8_t> x_i8,
+                  std::span<const float> x_scales,
+                  size_t scales_per_block,
+                  const char* who) {
+    check_len(x_i8.size(), nb * QK_K, who);
+    check_len(x_scales.size(), nb * scales_per_block, who);
+}
+
+#if SAPIENT_AARCH64
+// Accumulate four 4-element i8 dot products into an i32x4 — Rust's `sdot_s32` inline asm.
+SAPIENT_TARGET_DOTPROD inline int32x4_t sdot_s32(int32x4_t acc, int8x16_t w, int8x16_t x) {
+    return vdotq_s32(acc, w, x);
+}
+#endif
+
+} // namespace
+
+float detail::dot_q4_k_row_f32_scalar(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q4_k_row_f32: x shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+            for (size_t l = 0; l < 32; ++l) {
+                acc += (d1 * static_cast<float>(qs[q_off + l] & 0x0F) - m1v) * x[x_off + l];
+                acc += (d2 * static_cast<float>(qs[q_off + l] >> 4) - m2v) * x[x_off + l + 32];
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+// NEON Q4_K row dot: 8 packed bytes (16 nibbles) per iteration, FMA for the lo- and hi-nibble
+// sub-blocks, plus the Σx vectors for the min correction (quant.rs:661-748).
+float detail::dot_q4_k_row_f32_neon(std::span<const uint8_t> row_data, std::span<const float> x) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_len(x.size(), nb * QK_K, "dot_q4_k_row_f32: x shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    const uint8x8_t mask4 = vdup_n_u8(0x0F);
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+            const float* x_lo = x.data() + x_off;
+            const float* x_hi = x.data() + x_off + 32;
+
+            float32x4_t vsum_lo = vdupq_n_f32(0.0f); // dot(lo_nibbles, x_lo)
+            float32x4_t vsum_hi = vdupq_n_f32(0.0f); // dot(hi_nibbles, x_hi)
+            float32x4_t vsum_xl = vdupq_n_f32(0.0f); // sum(x_lo) for the min correction
+            float32x4_t vsum_xh = vdupq_n_f32(0.0f); // sum(x_hi)
+            for (size_t chunk = 0; chunk < 4; ++chunk) {
+                const uint8x8_t q8 = vld1_u8(qs + q_off + chunk * 8);
+                const uint8x8_t lo8 = vand_u8(q8, mask4);
+                const uint8x8_t hi8 = vshr_n_u8(q8, 4);
+                const uint16x8_t lo16 = vmovl_u8(lo8);
+                const float32x4_t lof0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)));
+                const float32x4_t lof1 = vcvtq_f32_u32(vmovl_high_u16(lo16));
+                const uint16x8_t hi16 = vmovl_u8(hi8);
+                const float32x4_t hif0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
+                const float32x4_t hif1 = vcvtq_f32_u32(vmovl_high_u16(hi16));
+                const float32x4_t xl0 = vld1q_f32(x_lo + chunk * 8);
+                const float32x4_t xl1 = vld1q_f32(x_lo + chunk * 8 + 4);
+                const float32x4_t xh0 = vld1q_f32(x_hi + chunk * 8);
+                const float32x4_t xh1 = vld1q_f32(x_hi + chunk * 8 + 4);
+                vsum_lo = vfmaq_f32(vsum_lo, lof0, xl0);
+                vsum_lo = vfmaq_f32(vsum_lo, lof1, xl1);
+                vsum_hi = vfmaq_f32(vsum_hi, hif0, xh0);
+                vsum_hi = vfmaq_f32(vsum_hi, hif1, xh1);
+                vsum_xl = vaddq_f32(vsum_xl, vaddq_f32(xl0, xl1));
+                vsum_xh = vaddq_f32(vsum_xh, vaddq_f32(xh0, xh1));
+            }
+            acc += d1 * vaddvq_f32(vsum_lo) - m1v * vaddvq_f32(vsum_xl);
+            acc += d2 * vaddvq_f32(vsum_hi) - m2v * vaddvq_f32(vsum_xh);
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+#endif
+
+float dot_q4_k_row_f32(std::span<const uint8_t> row_data, std::span<const float> x) {
+#if SAPIENT_AARCH64
+    return detail::dot_q4_k_row_f32_neon(row_data, x);
+#else
+    return detail::dot_q4_k_row_f32_scalar(row_data, x);
+#endif
+}
+
+float dot_q4_k_row_q8_scalar(std::span<const uint8_t> row_data,
+                             std::span<const int8_t> x_i8,
+                             std::span<const float> x_scales,
+                             std::span<const int32_t> x_sums) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, QK_K / QK, "dot_q4_k_row_q8_scalar: activations shorter than the row");
+    check_len(
+        x_sums.size(), nb * (QK_K / QK), "dot_q4_k_row_q8_scalar: x_sums shorter than the row");
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+            // lo nibbles → activation block at x_off; hi nibbles → block at x_off + 32.
+            const size_t blk_lo = x_off / QK;
+            const size_t blk_hi = (x_off + 32) / QK;
+            const int8_t* xlo = x_i8.data() + x_off;
+            const int8_t* xhi = x_i8.data() + x_off + 32;
+            int32_t dot_lo = 0;
+            int32_t dot_hi = 0;
+            for (size_t l = 0; l < 32; ++l) {
+                const int32_t nlo = static_cast<int32_t>(qs[q_off + l] & 0x0F);
+                const int32_t nhi = static_cast<int32_t>(qs[q_off + l] >> 4);
+                dot_lo += nlo * static_cast<int32_t>(xlo[l]);
+                dot_hi += nhi * static_cast<int32_t>(xhi[l]);
+            }
+            // Σx per sub-block comes precomputed (once per activation row).
+            acc += x_scales[blk_lo] *
+                   (d1 * static_cast<float>(dot_lo) - m1v * static_cast<float>(x_sums[blk_lo]));
+            acc += x_scales[blk_hi] *
+                   (d2 * static_cast<float>(dot_hi) - m2v * static_cast<float>(x_sums[blk_hi]));
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
+#if SAPIENT_AARCH64
+// NEON W4A8 Q4_K row dot — the fast decode kernel: `sdot` on the nibbles vs int8 activations,
+// Σx from the precomputed block sums (quant.rs:1084-1141). Bit-identical to the scalar W4A8.
+SAPIENT_TARGET_DOTPROD float dot_q4_k_row_q8_neon(std::span<const uint8_t> row_data,
+                                                  std::span<const int8_t> x_i8,
+                                                  std::span<const float> x_scales,
+                                                  std::span<const int32_t> x_sums) {
+    const size_t nb = row_data.size() / Q4_K_BLOCK_BYTES;
+    check_q8_row(
+        nb, x_i8, x_scales, QK_K / QK, "dot_q4_k_row_q8_neon: activations shorter than the row");
+    check_len(x_sums.size(), nb * (QK_K / QK), "dot_q4_k_row_q8_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    float acc = 0.0f;
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < nb; ++bi) {
+        const uint8_t* block = row_data.data() + bi * Q4_K_BLOCK_BYTES;
+        const auto [d, dmin] = q4k_header(block);
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs = block + 16;
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const auto [sc1, m1] = get_scale_min_k4(is, scales);
+            const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+            const float d1 = d * static_cast<float>(sc1);
+            const float m1v = dmin * static_cast<float>(m1);
+            const float d2 = d * static_cast<float>(sc2);
+            const float m2v = dmin * static_cast<float>(m2);
+
+            // 32 packed bytes → 32 lo nibbles (sub-block 2g) + 32 hi nibbles (2g+1).
+            const uint8x16_t q0 = vld1q_u8(qs + q_off);
+            const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+            const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+            const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+            const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+            const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+
+            const int32x4_t zero = vdupq_n_s32(0);
+            const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+            const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+
+            const size_t blk_lo = x_off / QK;
+            const size_t blk_hi = (x_off + 32) / QK;
+            acc += x_scales[blk_lo] *
+                   (d1 * static_cast<float>(dot_lo) - m1v * static_cast<float>(x_sums[blk_lo]));
+            acc += x_scales[blk_hi] *
+                   (d2 * static_cast<float>(dot_hi) - m2v * static_cast<float>(x_sums[blk_hi]));
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+
+// Four Q4_K rows against ONE int8 activation vector — the multi-row GEMV core: the activation
+// registers and sums are loaded once per 64-weight group and reused across the four rows; per-row
+// arithmetic (values and order) is identical to dot_q4_k_row_q8_neon (quant.rs:1154-1225).
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q4_k_4rows_q8_neon(std::array<std::span<const uint8_t>, 4> rows,
+                       std::span<const int8_t> x_i8,
+                       std::span<const float> x_scales,
+                       std::span<const int32_t> x_sums) {
+    const size_t n_blocks = rows[0].size() / Q4_K_BLOCK_BYTES;
+    for (const auto& r : rows)
+        check_len(r.size(),
+                  n_blocks * Q4_K_BLOCK_BYTES,
+                  "dot_q4_k_4rows_q8_neon: row shorter than row 0");
+    check_q8_row(n_blocks,
+                 x_i8,
+                 x_scales,
+                 QK_K / QK,
+                 "dot_q4_k_4rows_q8_neon: activations shorter than the row");
+    check_len(x_sums.size(),
+              n_blocks * (QK_K / QK),
+              "dot_q4_k_4rows_q8_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t bi = 0; bi < n_blocks; ++bi) {
+        const size_t base = bi * Q4_K_BLOCK_BYTES;
+        // Per-row super-block headers, hoisted once per block.
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(rows[r].data() + base);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            // Shared activation work: loaded ONCE for all 4 rows; sums precomputed.
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+            const int32_t sum_lo = x_sums[x_off / QK];
+            const int32_t sum_hi = x_sums[(x_off + 32) / QK];
+            const float xs_lo = x_scales[x_off / QK];
+            const float xs_hi = x_scales[(x_off + 32) / QK];
+
+            for (size_t r = 0; r < 4; ++r) {
+                const uint8_t* b = rows[r].data() + base;
+                const uint8_t* scales = b + 4;
+                const uint8_t* qs = b + 16;
+                const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                const float d1 = dv[r] * static_cast<float>(sc1);
+                const float m1v = dminv[r] * static_cast<float>(m1);
+                const float d2 = dv[r] * static_cast<float>(sc2);
+                const float m2v = dminv[r] * static_cast<float>(m2);
+
+                const uint8x16_t q0 = vld1q_u8(qs + q_off);
+                const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+                const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+                const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+                const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+
+                const int32x4_t zero = vdupq_n_s32(0);
+                const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+                const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+
+                acc[r] +=
+                    xs_lo * (d1 * static_cast<float>(dot_lo) - m1v * static_cast<float>(sum_lo));
+                acc[r] +=
+                    xs_hi * (d2 * static_cast<float>(dot_hi) - m2v * static_cast<float>(sum_hi));
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+#endif
+
+std::vector<uint8_t> repack_q4_k_rows4(std::span<const uint8_t> blocks, size_t n, size_t k) {
+    if (n % 4 != 0) panic("Q4_K_R4 repack: rows must be a multiple of 4");
+    if (k % QK_K != 0) panic("Q4_K_R4 repack: k must be a multiple of 256");
+    const size_t nb = k / QK_K;
+    const size_t row_bytes = nb * Q4_K_BLOCK_BYTES;
+    if (blocks.size() != n * row_bytes) panic("Q4_K_R4 repack: blocks.len() != n * row_bytes");
+    std::vector<uint8_t> out(blocks.size(), 0);
+    for (size_t g = 0; g < n / 4; ++g)
+        for (size_t b = 0; b < nb; ++b)
+            for (size_t r = 0; r < 4; ++r) {
+                const size_t src = ((g * 4 + r) * nb + b) * Q4_K_BLOCK_BYTES;
+                const size_t dst = (g * 4 * nb + b * 4 + r) * Q4_K_BLOCK_BYTES;
+                std::copy_n(blocks.data() + src, Q4_K_BLOCK_BYTES, out.data() + dst);
+            }
+    return out;
+}
+
+#if SAPIENT_AARCH64
+// Four Q4_K rows in the R4 layout: one contiguous stream `[r0.b, r1.b, r2.b, r3.b]` per block;
+// per-row arithmetic identical to dot_q4_k_row_q8_neon (quant.rs:1259-1330).
+SAPIENT_TARGET_DOTPROD std::array<float, 4>
+dot_q4_k_4rows_r4_neon(std::span<const uint8_t> packed,
+                       std::span<const int8_t> x_i8,
+                       std::span<const float> x_scales,
+                       std::span<const int32_t> x_sums) {
+    const size_t nb = packed.size() / (4 * Q4_K_BLOCK_BYTES);
+    check_q8_row(
+        nb, x_i8, x_scales, QK_K / QK, "dot_q4_k_4rows_r4_neon: activations shorter than the row");
+    check_len(
+        x_sums.size(), nb * (QK_K / QK), "dot_q4_k_4rows_r4_neon: x_sums shorter than the row");
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    std::array<float, 4> acc{};
+    size_t x_off = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        const size_t gbase = b * 4 * Q4_K_BLOCK_BYTES;
+        float dv[4];
+        float dminv[4];
+        for (size_t r = 0; r < 4; ++r) {
+            const auto [d, dmin] = q4k_header(packed.data() + gbase + r * Q4_K_BLOCK_BYTES);
+            dv[r] = d;
+            dminv[r] = dmin;
+        }
+        size_t q_off = 0;
+        size_t is = 0;
+        for (size_t g = 0; g < QK_K / 64; ++g) {
+            const int8x16_t xlo0 = vld1q_s8(x_i8.data() + x_off);
+            const int8x16_t xlo1 = vld1q_s8(x_i8.data() + x_off + 16);
+            const int8x16_t xhi0 = vld1q_s8(x_i8.data() + x_off + 32);
+            const int8x16_t xhi1 = vld1q_s8(x_i8.data() + x_off + 48);
+            const int32_t sum_lo = x_sums[x_off / QK];
+            const int32_t sum_hi = x_sums[(x_off + 32) / QK];
+            const float xs_lo = x_scales[x_off / QK];
+            const float xs_hi = x_scales[(x_off + 32) / QK];
+
+            for (size_t r = 0; r < 4; ++r) {
+                const uint8_t* blk = packed.data() + gbase + r * Q4_K_BLOCK_BYTES;
+                const uint8_t* scales = blk + 4;
+                const uint8_t* qs = blk + 16;
+                const auto [sc1, m1] = get_scale_min_k4(is, scales);
+                const auto [sc2, m2] = get_scale_min_k4(is + 1, scales);
+                const float d1 = dv[r] * static_cast<float>(sc1);
+                const float m1v = dminv[r] * static_cast<float>(m1);
+                const float d2 = dv[r] * static_cast<float>(sc2);
+                const float m2v = dminv[r] * static_cast<float>(m2);
+
+                const uint8x16_t q0 = vld1q_u8(qs + q_off);
+                const uint8x16_t q1 = vld1q_u8(qs + q_off + 16);
+                const int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(q0, mask));
+                const int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(q1, mask));
+                const int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                const int8x16_t hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+
+                const int32x4_t zero = vdupq_n_s32(0);
+                const int32_t dot_lo = vaddvq_s32(sdot_s32(sdot_s32(zero, lo0, xlo0), lo1, xlo1));
+                const int32_t dot_hi = vaddvq_s32(sdot_s32(sdot_s32(zero, hi0, xhi0), hi1, xhi1));
+
+                acc[r] +=
+                    xs_lo * (d1 * static_cast<float>(dot_lo) - m1v * static_cast<float>(sum_lo));
+                acc[r] +=
+                    xs_hi * (d2 * static_cast<float>(dot_hi) - m2v * static_cast<float>(sum_hi));
+            }
+            x_off += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+    return acc;
+}
+#endif
+
+// ── Q4_K × Q8_K, SMMLA (Task 3) ──────────────────────────────────────────────
 
 } // namespace sapient::backends_cpu::kernels::quant
