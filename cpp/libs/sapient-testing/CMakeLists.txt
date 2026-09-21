@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
-# Test-support library: reader for the Rust oracle's .sapd golden dumps. Not shipped.
-add_library(sapient_testing STATIC src/golden.cpp)
+# Test-support library: reader for the Rust oracle's .sapd golden dumps, plus the
+# bit-identical/abs-error comparison helpers gates are built from. Not shipped.
+add_library(sapient_testing STATIC src/golden.cpp src/compare.cpp)
 add_library(sapient::testing ALIAS sapient_testing)
 target_include_directories(sapient_testing PUBLIC include)
+target_link_libraries(sapient_testing PUBLIC GTest::gtest)
 sapient_apply_warnings(sapient_testing)
 
 if(SAPIENT_BUILD_TESTS)

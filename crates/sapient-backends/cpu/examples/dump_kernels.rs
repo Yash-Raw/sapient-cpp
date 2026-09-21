@@ -12,6 +12,12 @@
 //!   per array: u32 name_len | name | u8 dtype | u32 ndim | u64 dims[ndim] | u64 byte_len | bytes
 //!   dtype: 0=f32 1=u8 2=i8 3=i32 4=u32 5=u64.  Names are prefixed `in:` / `param:` / `out:`.
 //!
+//! Case families (`build_cases`): block quantizers (`quantize_q{4,8}_0_block`); row dot products
+//! (`dot_q{4,8}_0_row_f32`, `dot_q{4,5,6}_k_row_f32`); `matmul_nt_{f32,q8_0,q4_k,q6_k}_m{1,3,4}`;
+//! norm/activation/softmax (`rms_norm`, `softmax`, `silu`, `gelu_erf`); `apply_rope`;
+//! `attention_{prefill,decode}`; sapient-core dequant: `dequant_*` (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K,
+//! the Q4_K_R4/Q6_K_R4 row-interleaved layouts, and F16/BF16 widening+narrowing).
+//!
 //! Usage:
 //!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --out <dir> [--seed N]
 //!   cargo run --release -p sapient-backends-cpu --example dump_kernels -- --format-sample <file>
@@ -410,6 +416,99 @@ fn build_cases(seed: u64) -> Result<Vec<Case>, Box<dyn Error>> {
     };
     cases.push(case("attention_prefill", attn(&mut rng, 4, 4)?));
     cases.push(case("attention_decode", attn(&mut rng, 1, 5)?));
+
+    // ── sapient-core dequantisation (Tensor::to_f32_vec) — sub-project 1a plan A gates ──────────
+    let (dq_rows, dq_k) = (4usize, 512usize);
+    let dq: [(&str, DType, Vec<u8>); 5] = [
+        (
+            "dequant_q4_0",
+            DType::Q4_0,
+            q4_0_row(&rng.f32s(dq_rows * dq_k, -1.0, 1.0)),
+        ),
+        (
+            "dequant_q8_0",
+            DType::Q8_0,
+            q8_0_row(&rng.f32s(dq_rows * dq_k, -1.0, 1.0)),
+        ),
+        (
+            "dequant_q4_k",
+            DType::Q4_K,
+            kquant_rows(&mut rng, dq_rows, dq_k, q4_k_block),
+        ),
+        (
+            "dequant_q5_k",
+            DType::Q5_K,
+            kquant_rows(&mut rng, dq_rows, dq_k, q5_k_block),
+        ),
+        (
+            "dequant_q6_k",
+            DType::Q6_K,
+            kquant_rows(&mut rng, dq_rows, dq_k, q6_k_block),
+        ),
+    ];
+    for (name, dtype, bytes) in dq {
+        let t = Tensor::from_quant_bytes(&bytes, vec![dq_rows, dq_k], dtype)?;
+        cases.push(case(
+            name,
+            vec![
+                Array::u8("in:bytes", &[bytes.len()], &bytes),
+                Array::u32("param:shape", &[2], &[dq_rows as u32, dq_k as u32]),
+                Array::f32("out:f32", &[dq_rows * dq_k], &t.to_f32_vec()),
+            ],
+        ));
+    }
+    // Row-interleaved layouts: the backends-cpu repack is the only producer of R4 bytes.
+    let plain = kquant_rows(&mut rng, dq_rows, dq_k, q4_k_block);
+    let packed = quant::repack_q4_k_rows4(&plain, dq_rows, dq_k);
+    let t = Tensor::from_quant_bytes(&packed, vec![dq_rows, dq_k], DType::Q4_K_R4)?;
+    cases.push(case(
+        "dequant_q4_k_r4",
+        vec![
+            Array::u8("in:bytes", &[packed.len()], &packed),
+            Array::u32("param:shape", &[2], &[dq_rows as u32, dq_k as u32]),
+            Array::f32("out:f32", &[dq_rows * dq_k], &t.to_f32_vec()),
+        ],
+    ));
+    let plain = kquant_rows(&mut rng, dq_rows, dq_k, q6_k_block);
+    let packed = quant::repack_q6_k_rows4(&plain, dq_rows, dq_k);
+    let t = Tensor::from_quant_bytes(&packed, vec![dq_rows, dq_k], DType::Q6_K_R4)?;
+    cases.push(case(
+        "dequant_q6_k_r4",
+        vec![
+            Array::u8("in:bytes", &[packed.len()], &packed),
+            Array::u32("param:shape", &[2], &[dq_rows as u32, dq_k as u32]),
+            Array::f32("out:f32", &[dq_rows * dq_k], &t.to_f32_vec()),
+        ],
+    ));
+    // Half-precision storage: finite values only (NaN payload policy is not a parity target).
+    // `in:src_f32` lets the C++ side also check its f32→f16/bf16 narrowing against `half`.
+    let src = rng.f32s(64, -100.0, 100.0);
+    let f16_bytes: Vec<u8> = src
+        .iter()
+        .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+        .collect();
+    let t = Tensor::from_f16_bytes(&f16_bytes, vec![64])?;
+    cases.push(case(
+        "dequant_f16",
+        vec![
+            Array::f32("in:src_f32", &[64], &src),
+            Array::u8("in:bytes", &[128], &f16_bytes),
+            Array::f32("out:f32", &[64], &t.to_f32_vec()),
+        ],
+    ));
+    let bf16_bytes: Vec<u8> = src
+        .iter()
+        .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+        .collect();
+    let t = Tensor::from_bf16_bytes(&bf16_bytes, vec![64])?;
+    cases.push(case(
+        "dequant_bf16",
+        vec![
+            Array::f32("in:src_f32", &[64], &src),
+            Array::u8("in:bytes", &[128], &bf16_bytes),
+            Array::f32("out:f32", &[64], &t.to_f32_vec()),
+        ],
+    ));
 
     Ok(cases)
 }

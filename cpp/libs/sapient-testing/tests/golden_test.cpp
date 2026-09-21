@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 
+#include "sapient/testing/compare.hpp"
 #include "sapient/testing/golden.hpp"
 
 namespace fs = std::filesystem;
@@ -212,4 +213,32 @@ TEST(Golden, InventoryFromEnv) {
         EXPECT_TRUE(has_out) << f << " has no out: array";
     }
     std::printf("golden inventory: %zu cases in %s\n", files.size(), dir);
+}
+
+TEST(Compare, bit_identical_reports_first_mismatch_with_bits) {
+    const float a[] = {1.0f, 2.0f, 0.0f};
+    const float b[] = {1.0f, 2.0f, -0.0f}; // -0 differs bitwise
+    EXPECT_TRUE(sapient::testing::bit_identical(a, a));
+    const auto r = sapient::testing::bit_identical(a, b);
+    EXPECT_FALSE(r);
+    EXPECT_NE(std::string(r.message()).find("[2]"), std::string::npos) << r.message();
+    EXPECT_NE(std::string(r.message()).find("0x80000000"), std::string::npos) << r.message();
+    const float c[] = {1.0f};
+    EXPECT_FALSE(sapient::testing::bit_identical(a, c)); // length mismatch
+}
+
+TEST(Compare, within_abs_and_max_abs_err) {
+    const float a[] = {1.0f, 2.0f};
+    const float b[] = {1.0f, 2.5f};
+    EXPECT_EQ(sapient::testing::max_abs_err(a, b), 0.5f);
+    EXPECT_TRUE(sapient::testing::within_abs(a, b, 0.5f));
+    EXPECT_FALSE(sapient::testing::within_abs(a, b, 0.4f));
+}
+
+TEST(Compare, golden_case_macro_skips_without_env) {
+    if (std::getenv("SAPIENT_GOLDEN_DIR") != nullptr)
+        GTEST_SKIP() << "env set; the skip path is exercised without it";
+    std::string why;
+    EXPECT_FALSE(sapient::testing::load_golden_case("does_not_matter", &why).has_value());
+    EXPECT_NE(why.find("SAPIENT_GOLDEN_DIR"), std::string::npos);
 }

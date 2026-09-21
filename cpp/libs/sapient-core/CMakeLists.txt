@@ -9,8 +9,8 @@ sapient_apply_warnings(sapient_core)
 
 if(SAPIENT_BUILD_TESTS)
   add_executable(sapient_core_tests
-    tests/version_test.cpp tests/build_flags_test.cpp tests/error_test.cpp tests/dtype_test.cpp tests/shape_test.cpp tests/f16_test.cpp tests/buffer_test.cpp tests/dequant_test.cpp tests/tensor_test.cpp)
-  target_link_libraries(sapient_core_tests PRIVATE sapient::core GTest::gtest_main)
+    tests/version_test.cpp tests/build_flags_test.cpp tests/error_test.cpp tests/dtype_test.cpp tests/shape_test.cpp tests/f16_test.cpp tests/buffer_test.cpp tests/dequant_test.cpp tests/tensor_test.cpp tests/golden_dequant_test.cpp)
+  target_link_libraries(sapient_core_tests PRIVATE sapient::core sapient::testing GTest::gtest_main)
   target_compile_definitions(sapient_core_tests PRIVATE
     SAPIENT_VERSION_STRING="${PROJECT_VERSION}"
     SAPIENT_CARGO_TOML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../Cargo.toml")
