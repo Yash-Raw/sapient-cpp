@@ -39,20 +39,37 @@ within_abs(std::span<const float> got, std::span<const float> ref, float tol);
 
 } // namespace sapient::testing
 
+// Local counterpart of sapient/core/error.hpp's SAPIENT_CAT/SAPIENT_CAT_ (not included here to
+// keep sapient::testing independent of sapient::core) — used below to give SAPIENT_GOLDEN_CASE's
+// temporaries __COUNTER__-unique names, like SAPIENT_TRY, so two cases can share a test body.
+#define SAPIENT_TESTING_CAT_(a, b) a##b
+#define SAPIENT_TESTING_CAT(a, b) SAPIENT_TESTING_CAT_(a, b)
+
 /// Bind `var` to the named golden case. Two distinct bail-out behaviours:
 ///   - `SAPIENT_GOLDEN_DIR` unset: dumps were never generated for this host — SKIP (visible,
 ///     not a silent pass).
 ///   - `SAPIENT_GOLDEN_DIR` set but the named case is missing/unreadable: FAIL. A stale local
 ///     dump directory (e.g. after this task added new cases) must not silently turn a
 ///     bit-identity gate into a skip.
-#define SAPIENT_GOLDEN_CASE(var, name)                                                             \
-    std::string sapient_golden_why_;                                                               \
-    auto sapient_golden_opt_ = ::sapient::testing::load_golden_case((name), &sapient_golden_why_); \
-    if (!sapient_golden_opt_.has_value()) {                                                        \
+// `var`, `why_var`, `opt_var` below are declarator names, never expressions — parenthesizing them
+// (bugprone-macro-parentheses' usual advice) is inapplicable, the same reasoning as
+// sapient/core/error.hpp's SAPIENT_TRY_IMPL.
+// NOLINTBEGIN(bugprone-macro-parentheses)
+#define SAPIENT_GOLDEN_CASE_IMPL(var, why_var, opt_var, name)                                      \
+    std::string why_var;                                                                           \
+    auto opt_var = ::sapient::testing::load_golden_case((name), &why_var);                         \
+    if (!opt_var.has_value()) {                                                                    \
         if (::sapient::testing::golden_dir().has_value()) {                                        \
-            FAIL() << sapient_golden_why_;                                                         \
+            FAIL() << why_var;                                                                     \
         } else {                                                                                   \
-            GTEST_SKIP() << sapient_golden_why_;                                                   \
+            GTEST_SKIP() << why_var;                                                               \
         }                                                                                          \
     }                                                                                              \
-    const ::sapient::testing::GoldenCase& var = *sapient_golden_opt_
+    const ::sapient::testing::GoldenCase& var = *opt_var
+
+#define SAPIENT_GOLDEN_CASE(var, name)                                                             \
+    SAPIENT_GOLDEN_CASE_IMPL(var,                                                                  \
+                             SAPIENT_TESTING_CAT(sapient_golden_why_, __COUNTER__),                \
+                             SAPIENT_TESTING_CAT(sapient_golden_opt_, __COUNTER__),                \
+                             name)
+// NOLINTEND(bugprone-macro-parentheses)

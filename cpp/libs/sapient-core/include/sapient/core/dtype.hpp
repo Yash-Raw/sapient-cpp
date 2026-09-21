@@ -67,7 +67,6 @@ constexpr size_t element_size(DType d) {
     case DType::F32:
         return 4;
     case DType::F16:
-        return 2;
     case DType::BF16:
         return 2;
     case DType::I32:
@@ -75,7 +74,6 @@ constexpr size_t element_size(DType d) {
     case DType::I64:
         return 8;
     case DType::U8:
-        return 1;
     case DType::Bool:
         return 1;
     default:

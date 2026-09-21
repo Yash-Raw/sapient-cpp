@@ -3,7 +3,6 @@
 #include "sapient/core/error.hpp"
 
 #include <cstdio>
-#include <sstream>
 
 namespace sapient::core {
 
@@ -17,9 +16,10 @@ std::string debug_dims(const std::vector<size_t>& dims) {
 }
 
 namespace {
-// Rust `{:?}` on a String: double-quoted with \" \\ \n \t \r \0 escaped, and every other control
-// byte (< 0x20 or == 0x7F) as `\u{XX}` (lowercase hex, no zero padding) — matches
-// `char::escape_debug`.
+// Rust `{:?}` on a String: double-quoted with \" \\ \n \t \r \0 escaped; every other ASCII
+// control byte (< 0x20 or == 0x7F) is escaped as `\u{XX}` (lowercase hex, no zero padding) like
+// `char::escape_debug`. Non-ASCII scalars pass through as UTF-8 (Rust would `\u{…}`-escape
+// non-printables outside ASCII too — IR-path only, not hit by any current caller).
 std::string debug_str(const std::string& s) {
     std::string out = "\"";
     for (const char c : s) {

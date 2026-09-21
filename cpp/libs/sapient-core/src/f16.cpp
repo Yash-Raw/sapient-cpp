@@ -25,6 +25,7 @@ float f16_bits_to_f32(uint16_t h) {
         }
     } else if (exp == 31) {
         bits = sign | 0x7F800000u | (mant << 13); // inf, or NaN with the payload shifted up
+        if (mant != 0) bits |= 0x00400000u; // quiet a signalling NaN on widening, matching `half`
     } else {
         bits = sign | ((exp + 112u) << 23) | (mant << 13);
     }

@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -105,6 +104,10 @@ std::string debug_dims(const std::vector<size_t>& dims);
 // once (here, by the outer SAPIENT_TRY/SAPIENT_TRY_ASSIGN passing it to the _IMPL macro below) and
 // then referenced via that argument's already-expanded name, never written as `__COUNTER__`
 // itself more than once per invocation.
+// `var` and `lhs` below are declarator names / assignment targets, never expressions, so
+// bugprone-macro-parentheses' "wrap the parameter in parens" advice is inapplicable — parenthesizing
+// a declarator or an assignment target would not compile.
+// NOLINTBEGIN(bugprone-macro-parentheses)
 #define SAPIENT_TRY_IMPL(var, expr)                                                                \
     do {                                                                                           \
         auto&& var = (expr);                                                                       \
@@ -118,6 +121,7 @@ std::string debug_dims(const std::vector<size_t>& dims);
     auto&& var = (expr);                                                                           \
     if (!var.has_value()) return ::tl::unexpected(std::move(var.error()));                         \
     lhs = std::move(*var)
+// NOLINTEND(bugprone-macro-parentheses)
 
 /// `lhs = expr?;` — `lhs` may be a declaration (`int v`) or an existing lvalue.
 ///

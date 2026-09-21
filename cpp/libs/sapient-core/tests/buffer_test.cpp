@@ -69,3 +69,10 @@ TEST(CpuBuffer, bad_alignment_is_an_error) {
     ASSERT_FALSE(b.has_value());
     EXPECT_EQ(b.error().to_string(), "Allocation failed: requested 8 bytes (alignment 3)");
 }
+TEST(CpuBuffer, small_alignment_is_reported_as_requested) {
+    auto b = CpuBuffer::with_capacity(8, 2);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ((*b)->len(), 8u);
+    EXPECT_EQ((*b)->alignment(), 2u);
+    EXPECT_NE((*b)->data(), nullptr);
+}

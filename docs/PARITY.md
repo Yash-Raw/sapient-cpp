@@ -20,10 +20,10 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
 
 ### Open gaps carried from sub-project 0
 
-- (a) The golden dumps cover the 22 public entry points only — `Q4_K_R4`/`Q6_K_R4` (SDOT/SMMLA/Q8_K
-  decode paths), `apply_rope_partial`, and the `quantize_row_to_i8_blocks` /
-  `quantize_row_to_q8k` activation formats are not dumped yet and must be added before 1a claims
-  bit-identity on them.
+- (a) The golden dumps cover the 22 public entry points plus, as of plan A, the R4 **dequant**
+  path (`dequant_q4_k_r4`/`dequant_q6_k_r4`) — the R4 **matmul** cases (SDOT/SMMLA/Q8_K activation
+  formats), `apply_rope_partial`, and the `quantize_row_to_i8_blocks` /
+  `quantize_row_to_q8k` activation formats remain open for plan D.
 - (b) The FMA-contraction detector's x86 twin (`BuildFlags.FpContractIsOffUnderFmaTarget`) is
   exercised only on the Linux/Windows CI hosts — this repo's dev/test host is arm64, where the
   `#if defined(__x86_64__) || defined(_M_X64)` block compiles out entirely.
@@ -35,8 +35,8 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
 
 | Date | Gate | Host / ISA path | Rust commit | C++ commit | Result |
 |---|---|---|---|---|---|
-| 2026-09-21 | 22 sapient-core unit tests ported by name (+ f16 exhaustive round trip, dequant unit tests) | macOS arm64 (Apple M5) | `8fdf25f` | `adbf167` | pass |
-| 2026-09-21 | `dequant_{q4_0,q8_0,q4_k,q5_k,q6_k,q4_k_r4,q6_k_r4}` (4×512) + `dequant_{f16,bf16}` (64) vs Rust `Tensor::to_f32_vec` / `half` narrowing | macOS arm64 | `8fdf25f` | `adbf167` | bit-identical, 9/9 |
+| 2026-09-21 | 22 sapient-core unit tests ported by name (+ f16 exhaustive round trip, dequant unit tests) | macOS arm64 (Apple M5) | — | adbf167 | pass |
+| 2026-09-21 | `dequant_{q4_0,q8_0,q4_k,q5_k,q6_k,q4_k_r4,q6_k_r4}` (4×512) + `dequant_{f16,bf16}` (64) vs Rust `Tensor::to_f32_vec` / `half` narrowing | macOS arm64 | 8fdf25f | adbf167 | bit-identical, 9/9 |
 
 ## Sub-project 1b — CPU chat vertical slice
 

@@ -16,4 +16,15 @@ if(SAPIENT_BUILD_TESTS)
     SAPIENT_CARGO_TOML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../Cargo.toml")
   sapient_apply_warnings(sapient_core_tests)
   gtest_discover_tests(sapient_core_tests)
+
+  # D3: pins SAPIENT_GOLDEN_CASE's "env set but case missing" FAIL branch (compare.hpp) against a
+  # real empty golden directory, without mutating SAPIENT_GOLDEN_DIR in-process (which would race
+  # every other test in this binary that reads it). WILL_FAIL means the underlying gtest run must
+  # itself fail for this ctest entry to report as passing.
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/empty-golden")
+  add_test(NAME sapient_testing_golden_case_fails_on_stale_dir
+    COMMAND sapient_core_tests --gtest_filter=Quant/GoldenDequant.matches_rust_to_f32_vec/dequant_q4_0)
+  set_tests_properties(sapient_testing_golden_case_fails_on_stale_dir PROPERTIES
+    ENVIRONMENT "SAPIENT_GOLDEN_DIR=${CMAKE_CURRENT_BINARY_DIR}/empty-golden"
+    WILL_FAIL TRUE)
 endif()

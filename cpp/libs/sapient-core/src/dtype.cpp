@@ -94,7 +94,7 @@ std::string_view name(DType d) {
     case DType::Q6_K_R4:
         return "q6_k_r4";
     }
-    return "?";
+    return "?"; // out-of-enumerator guard (Rust's enum is #[non_exhaustive]); satisfies -Wreturn-type
 }
 std::string to_string(DType d) {
     return std::string(name(d));
@@ -105,8 +105,9 @@ std::ostream& operator<<(std::ostream& os, DType d) {
 
 Result<DType> dtype_from_str(std::string_view sv) {
     std::string s(sv);
+    // ASCII-only lowering (Rust `to_ascii_lowercase` parity) — std::tolower is locale-sensitive.
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
     });
     if (s == "f32" || s == "float32") return DType::F32;
     if (s == "f16" || s == "float16") return DType::F16;

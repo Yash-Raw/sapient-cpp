@@ -7,7 +7,6 @@
 
 #include <bit>
 #include <cstdint>
-#include <cstring>
 
 namespace sapient::core {
 
@@ -15,7 +14,10 @@ float f16_bits_to_f32(uint16_t h);
 uint16_t f32_to_f16_bits(float f);
 
 inline float bf16_bits_to_f32(uint16_t b) {
-    return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
+    uint32_t bits = static_cast<uint32_t>(b) << 16;
+    // Quiet a signalling NaN on widening, matching `half`'s f16_to_f32_fallback.
+    if ((b & 0x7F80u) == 0x7F80u && (b & 0x007Fu) != 0u) bits |= 0x00400000u;
+    return std::bit_cast<float>(bits);
 }
 uint16_t f32_to_bf16_bits(float f);
 

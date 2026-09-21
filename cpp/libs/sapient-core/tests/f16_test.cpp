@@ -54,6 +54,16 @@ TEST(F16, every_non_nan_half_round_trips) {
     }
 }
 
+TEST(F16, widening_quiets_signalling_nan) {
+    const float h = f16_bits_to_f32(0x7C01); // f16 signalling NaN (exp all-1, mant bit 9 unset)
+    EXPECT_TRUE(std::isnan(h));
+    EXPECT_NE(std::bit_cast<uint32_t>(h) & 0x00400000u, 0u);
+
+    const float b = bf16_bits_to_f32(0x7F81); // bf16 signalling NaN (exp all-1, mant bit 6 unset)
+    EXPECT_TRUE(std::isnan(b));
+    EXPECT_NE(std::bit_cast<uint32_t>(b) & 0x00400000u, 0u);
+}
+
 TEST(F16, bf16) {
     EXPECT_EQ(bf16_bits_to_f32(0x3F80), 1.0f);
     EXPECT_EQ(f32_to_bf16_bits(1.0f), 0x3F80);

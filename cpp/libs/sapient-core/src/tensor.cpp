@@ -3,6 +3,7 @@
 #include "sapient/core/tensor.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 #include "sapient/core/dequant.hpp"
@@ -10,6 +11,21 @@
 #include "sapient/core/panic.hpp"
 
 namespace sapient::core {
+
+namespace {
+// Bounds-checked span slicing: mirrors Rust's slice-index panic (`buf[offset..offset+len]`
+// panics out of bounds) where plain `std::span::subspan` would be UB instead. Unreachable today
+// (every caller already keeps `offset_`/`byte_count` in bounds) — this is a defensive parity
+// guard, not a currently-exercised path.
+template <class Span> Span checked_subspan(Span s, size_t offset, size_t len) {
+    if (offset > s.size() || len > s.size() - offset) panic("Tensor: byte range out of buffer");
+    return s.subspan(offset, len);
+}
+template <class Span> Span checked_subspan(Span s, size_t offset) {
+    if (offset > s.size()) panic("Tensor: byte range out of buffer");
+    return s.subspan(offset);
+}
+} // namespace
 
 Result<Tensor> Tensor::zeros(Shape shape, DType dtype) {
     SAPIENT_TRY(shape.validate());
@@ -86,8 +102,8 @@ Result<Tensor> Tensor::from_buffer(Shape shape, DType dtype, BufferHandle buffer
 
 std::span<const uint8_t> Tensor::bytes() const {
     const auto all = buffer_->bytes();
-    if (is_quantized(dtype_)) return all.subspan(offset_, byte_count(dtype_, numel()));
-    return all.subspan(offset_);
+    if (is_quantized(dtype_)) return checked_subspan(all, offset_, byte_count(dtype_, numel()));
+    return checked_subspan(all, offset_);
 }
 
 std::span<const uint8_t> Tensor::quant_blocks() const {
@@ -152,12 +168,16 @@ std::vector<float> Tensor::to_f32_vec() const {
     }
     case DType::Q4_K_R4: {
         if (shape_.dims.empty()) panic("Q4_K_R4 tensor must be 2-D");
+        if (n == 0)
+            return {}; // a zero-width view (e.g. slice_axis(last, i, i)) would divide by zero below
         std::vector<float> out(n, 0.0f);
         dequant::q4_k_r4(bytes(), n / shape_.dims.back(), shape_.dims.back(), out.data());
         return out;
     }
     case DType::Q6_K_R4: {
         if (shape_.dims.empty()) panic("Q6_K_R4 tensor must be 2-D");
+        if (n == 0)
+            return {}; // a zero-width view (e.g. slice_axis(last, i, i)) would divide by zero below
         std::vector<float> out(n, 0.0f);
         dequant::q6_k_r4(bytes(), n / shape_.dims.back(), shape_.dims.back(), out.data());
         return out;
@@ -183,8 +203,8 @@ std::vector<float> Tensor::to_contiguous_f32_vec() const {
     const size_t n = numel();
     if (is_contiguous()) {
         if (dtype_ == DType::F32) {
-            const auto s = f32_slice();
-            return {s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n)};
+            const auto s = checked_subspan(f32_slice(), 0, n);
+            return {s.begin(), s.end()};
         }
         auto v = to_f32_vec();
         v.resize(std::min(n, v.size()));
@@ -214,7 +234,7 @@ Result<std::span<uint8_t>> Tensor::bytes_mut() {
     if (buffer_.use_count() != 1)
         return tl::unexpected(Error::internal("Cannot mutate shared tensor buffer"));
     const size_t end = offset_ + byte_count(dtype_, numel());
-    return buffer_->bytes_mut().subspan(offset_, end - offset_);
+    return checked_subspan(buffer_->bytes_mut(), offset_, end - offset_);
 }
 
 Result<std::span<float>> Tensor::f32_slice_mut() {
@@ -247,6 +267,7 @@ Result<Tensor> Tensor::slice_axis(size_t axis, size_t start, size_t end) const {
     Shape s = shape_;
     s.dims[axis] = end - start;
     // Rust parity: element_size() is 0 for quantized dtypes, so the offset does not move (documented trap).
+    assert(!is_quantized(dtype_) || start == 0);
     const size_t off = offset_ + start * strides_[axis] * element_size(dtype_);
     return Tensor(std::move(s), dtype_, strides_, buffer_, off);
 }

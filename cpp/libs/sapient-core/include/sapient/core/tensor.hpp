@@ -23,11 +23,18 @@
 namespace sapient::core {
 
 /// Rust `Cow<'_, [f32]>`: a borrowed view when the tensor is already F32, else an owned copy.
+///
+/// The Tensor that produced this Cow must outlive it (the borrowed `view` arm points into the
+/// Tensor's buffer), and this Cow must outlive any span returned by `get()` (the owned arm's span
+/// points into `owned`). `get()` is therefore only callable on an lvalue Cow — calling it on a
+/// temporary (e.g. `t.to_f32_cow().get()`) would return a span into memory that is destroyed at
+/// the end of that full expression, which is undefined behaviour on the owned arm.
 struct F32Cow {
     std::span<const float> view;
     std::vector<float> owned;
     bool is_owned{false};
-    std::span<const float> get() const { return is_owned ? std::span<const float>(owned) : view; }
+    std::span<const float> get() const& { return is_owned ? std::span<const float>(owned) : view; }
+    std::span<const float> get() && = delete;
 };
 
 class Tensor {
@@ -46,7 +53,15 @@ public:
     size_t ndim() const { return shape_.ndim(); }
     size_t numel() const { return shape_.numel(); }
     std::span<const size_t> strides() const { return strides_; }
-    const BufferHandle& buffer() const { return buffer_; }
+    /// Read-only access (the twin of Rust's `&Arc<dyn Buffer>` deref): `len()`, `is_mmap()`,
+    /// `alignment()`, `device()`, `bytes()`. Deliberately NOT `bytes_mut()` — that needs a
+    /// `BufferHandle` with `use_count()==1`, which a const reference cannot prove; use
+    /// `share_buffer()` to build a second handle if you need to check/act on that.
+    const Buffer& buffer() const { return *buffer_; }
+    /// The twin of Rust's `Arc::clone`: a new handle sharing this tensor's buffer, for building
+    /// views via `from_buffer`. Bumps `use_count`, so `bytes_mut()` on either tensor errors until
+    /// the other handle is dropped — exactly `Arc::get_mut`'s exclusivity rule.
+    BufferHandle share_buffer() const { return buffer_; }
     size_t offset() const { return offset_; }
     bool is_scalar() const { return shape_.is_scalar() || numel() == 1; }
     bool is_contiguous() const { return strides_ == shape_.strides() && offset_ == 0; }

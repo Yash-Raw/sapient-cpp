@@ -32,15 +32,17 @@ TEST(Tensor, from_f32_roundtrip) {
 TEST(Tensor, reshape_preserves_data) {
     const float data[] = {1, 2, 3, 4, 5, 6};
     auto t = Tensor::from_f32(data, {2, 3});
+    ASSERT_TRUE(t.has_value());
     auto r = t->reshape({3, 2});
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->shape().dims, (std::vector<size_t>{3, 2}));
     EXPECT_EQ(r->f32_slice()[5], 6.0f);
-    EXPECT_EQ(r->buffer().get(), t->buffer().get()); // shared buffer, no copy
+    EXPECT_EQ(&r->buffer(), &t->buffer()); // shared buffer, no copy
 }
 // Rust: reshape_wrong_numel
 TEST(Tensor, reshape_wrong_numel) {
     auto t = Tensor::zeros({2, 3}, DType::F32);
+    ASSERT_TRUE(t.has_value());
     EXPECT_FALSE(t->reshape({5}).has_value());
 }
 // Rust: transpose_2d
@@ -52,8 +54,9 @@ TEST(Tensor, transpose_2d) {
     EXPECT_EQ(tt->strides()[0], 1u);
     EXPECT_EQ(tt->strides()[1], 4u);
     EXPECT_FALSE(tt->is_contiguous());
-    EXPECT_EQ(Tensor::zeros({3}, DType::F32)->t().error().to_string(),
-              "Internal error: t() requires a 2-D tensor");
+    auto z = Tensor::zeros({3}, DType::F32);
+    ASSERT_TRUE(z.has_value());
+    EXPECT_EQ(z->t().error().to_string(), "Internal error: t() requires a 2-D tensor");
 }
 // Rust: byte_size
 TEST(Tensor, byte_size) {
@@ -146,4 +149,13 @@ TEST(Tensor, f16_bf16_and_cow) {
     EXPECT_EQ(Tensor::from_f16_bytes(h, {3}).error().to_string(),
               "Shape mismatch: expected [3], got [2]");
     EXPECT_EQ(t.to_string(), "Tensor(shape=[2], dtype=f16, device=cpu)");
+}
+TEST(Tensor, from_f32_vec_is_zero_copy) {
+    std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float* captured = data.data();
+    auto t = Tensor::from_f32_vec(std::move(data), {4});
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(t->dtype(), DType::F32);
+    EXPECT_EQ(t->numel(), 4u);
+    EXPECT_EQ(t->f32_slice().data(), captured);
 }

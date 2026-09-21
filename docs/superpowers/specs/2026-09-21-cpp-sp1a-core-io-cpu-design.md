@@ -106,7 +106,11 @@ the same defaults — see the kernels porting map §2.10.
   helpers live in `sapient::testing` (`expect_bit_identical` over `std::bit_cast<uint32_t>` so
   NaN/−0 compare exactly; `max_abs_err`; `case_or_skip`). Bit-identical unless the case is
   sgemm-backed (`matmul_nt_f32_m4`, `conv2d`, float prefill), which use
-  `max_abs_err ≤ 1e-5 · max(1, max|ref|)`.
+  `max_abs_err ≤ 1e-5 · max(1, max|ref|)`. **As built (plan A):** these shipped as
+  `sapient::testing::bit_identical` (not `expect_bit_identical`) and the `SAPIENT_GOLDEN_CASE(var,
+  name)` macro (not `case_or_skip`) — `SAPIENT_GOLDEN_DIR` unset SKIPs, set-but-the-named-case-
+  missing FAILs (a stale local dump directory must not silently downgrade a bit-identity gate to
+  a skip).
 - **Dump cases added by plan:** A — `to_f32_vec` of random Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/Q4_K_R4/
   Q6_K_R4/F16/BF16 tensors; C — `layer_norm`, `conv2d` (stride 1 and 2, groups 1), `reduce_*`,
   `apply_rope_partial(_scaled)`, masked `attention`, `gelu`, `softmax` axis 0, `log_softmax`,

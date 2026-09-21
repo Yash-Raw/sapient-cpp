@@ -640,7 +640,7 @@ Useful chat commands while chatting: `/help`, `/clear` (forget the conversation)
 
 ### The C++ tree (in progress)
 
-The C++ port lives in `cpp/` and builds with CMake + Ninja + Clang: `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev`. Today it contains only the scaffolding and the "answer-key" machinery: a reader for the kernel test data the Rust build writes (`just cpp-golden`), header/shader lint gates, and CI jobs that build both languages on the same machine and compare them. Real inference code arrives with sub-projects 1a/1b (see `docs/ROADMAP.md` Phase 7 and `docs/PARITY.md`).
+The C++ port lives in `cpp/` and builds with CMake + Ninja + Clang: `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev`. Sub-project 0 landed the scaffolding and the "answer-key" machinery: a reader for the kernel test data the Rust build writes (`just cpp-golden`), header/shader lint gates, and CI jobs that build both languages on the same machine and compare them. Sub-project 1a plan A then landed the first ported library, `sapient::core` (`cpp/libs/sapient-core/`: `Tensor`/`DType`/`Shape`/`Buffer`/`f16`/the shared dequantiser) plus `sapient::testing`'s compare helpers — the golden-dump gates on it are bit-identical to the Rust oracle. The forward engines follow with sub-project 1b (see `docs/ROADMAP.md` Phase 7 and `docs/PARITY.md`).
 
 ---
 
