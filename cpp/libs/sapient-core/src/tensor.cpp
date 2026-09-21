@@ -97,12 +97,8 @@ std::span<const uint8_t> Tensor::quant_blocks() const {
 
 std::span<const float> Tensor::f32_slice() const {
     if (dtype_ != DType::F32) panic("as_f32_slice() called on a non-F32 tensor");
-    // `bytes()` is unbounded for F32 (runs to the end of the buffer — see the class docs), so its
-    // length need not be a multiple of 4 when the tensor is a narrow view over a buffer sized for
-    // something else (bytes_bounded_for_quant_unbounded_for_float exercises exactly this via
-    // Tensor::from_buffer). Truncate rather than panic: any trailing < 4 bytes are simply unreachable
-    // through this view, matching the "unbounded" contract in the Produces interface list.
     const auto b = bytes();
+    if (b.size() % 4 != 0) panic("Buffer length not a multiple of 4");
     return {reinterpret_cast<const float*>(b.data()), b.size() / 4};
 }
 

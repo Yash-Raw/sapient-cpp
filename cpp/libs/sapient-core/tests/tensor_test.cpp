@@ -90,12 +90,21 @@ TEST(Tensor, bytes_bounded_for_quant_unbounded_for_float) {
     auto q = Tensor::from_buffer({64}, DType::Q8_0, buf, 0);
     ASSERT_TRUE(q.has_value());
     EXPECT_EQ(q->bytes().size(), 68u); // bounded by byte_count(64)
-    auto f = Tensor::from_buffer({4}, DType::F32, buf, 0);
+    // The float view is unbounded to the end of ITS OWN buffer, not to shape().numel() — a
+    // separate 80-byte (4-aligned) buffer keeps bytes()/f32_slice() beyond numel()==4 without
+    // hitting the len%4!=0 panic that f32_slice_panics_on_unaligned_length exercises below.
+    auto buf80 = *CpuBuffer::with_capacity(80, 16);
+    auto f = Tensor::from_buffer({4}, DType::F32, buf80, 0);
     ASSERT_TRUE(f.has_value());
-    EXPECT_EQ(f->bytes().size(), 78u);     // unbounded: to the end of the buffer (Rust parity)
-    EXPECT_EQ(f->f32_slice().size(), 19u); // 78 / 4 truncating
+    EXPECT_EQ(f->bytes().size(), 80u);     // unbounded: to the end of the buffer (Rust parity)
+    EXPECT_EQ(f->f32_slice().size(), 20u); // 80 / 4, whole buffer as f32 elements
     EXPECT_EQ(Tensor::from_buffer({64}, DType::Q8_0, buf, 20).error().to_string(),
               "Buffer size mismatch: expected 88 bytes, got 78");
+}
+TEST(Tensor, f32_slice_panics_on_unaligned_length) {
+    auto buf = *CpuBuffer::with_capacity(34 * 2 + 10, 16); // 78 bytes — not a multiple of 4
+    auto t = *Tensor::from_buffer({4}, DType::F32, buf, 0);
+    EXPECT_DEATH(t.f32_slice(), "sapient panic");
 }
 TEST(Tensor, bytes_mut_requires_exclusive_ownership) {
     auto t = *Tensor::zeros({4}, DType::F32);
