@@ -3,10 +3,13 @@
 #include "sapient/backends_cpu/kernels/matmul.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@
 
 #include "sapient/backends_cpu/cpu_features.hpp"
 #include "sapient/backends_cpu/env.hpp"
+#include "sapient/backends_cpu/kernels/quant.hpp"
 #include "sapient/backends_cpu/parallel.hpp"
 #include "sapient/backends_cpu/sgemm.hpp"
 #include "sapient/backends_cpu/spinpool.hpp"
@@ -205,6 +209,487 @@ Result<Tensor> matmul_nt_float(const Tensor& x, const Tensor& w, size_t m, size_
     return Tensor::from_f32_vec(std::move(out), Shape{m, n});
 }
 
+// ── quantized arms (matmul.rs:538-1170) ──────────────────────────────────────
+
+namespace quant = sapient::backends_cpu::kernels::quant;
+
+// gemv_parallel!: n rows of a quantized GEMV, `dot(w_row_bytes, x_row)` per row, rows batched per
+// task by gemv_chunk (matmul.rs:538-548).
+template <class Dot>
+void gemv_parallel(std::span<float> out_row,
+                   size_t n,
+                   size_t row_bytes,
+                   std::span<const uint8_t> w_blocks,
+                   std::span<const float> x_row,
+                   Dot dot) {
+    const size_t chunk = detail::gemv_chunk(n);
+    detail::for_each_out_chunk(out_row, chunk, [&](size_t chunk_idx, std::span<float> cs) {
+        for (size_t local = 0; local < cs.size(); ++local) {
+            const size_t j = chunk_idx * chunk + local;
+            cs[local] = dot(w_blocks.subspan(j * row_bytes, row_bytes), x_row);
+        }
+    });
+}
+
+// Rust's slice panics on `x_data[i*k..(i+1)*k]` / `w_blocks[j*row_bytes..]`, checked once.
+void check_quant_operands(std::span<const float> x_data,
+                          std::span<const uint8_t> w_blocks,
+                          size_t m,
+                          size_t k,
+                          size_t n,
+                          size_t row_bytes) {
+    if (x_data.size() < m * k) sapient::core::panic("matmul_nt: x shorter than [m, k]");
+    if (w_blocks.size() < n * row_bytes)
+        sapient::core::panic("matmul_nt: quantized weight buffer shorter than [n, k]");
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+// Per-32 int8 activations + their sums, or the Q8_K format — the `(x_i8, x_scales, x_sums)`
+// triple every Q4_K SDOT path builds per activation row (matmul.rs:733-744, 811-815, 884-890).
+quant::Q8kRow quantize_q4k_activations(std::span<const float> row, bool q8k) {
+    if (q8k) return quant::quantize_row_to_q8k(row);
+    auto q = quant::quantize_row_to_i8_blocks(row);
+    auto sums = quant::i8_block_sums(q.q);
+    return quant::Q8kRow{std::move(q.q), std::move(q.scales), std::move(sums)};
+}
+// The `(x_i8, x_scales)` pair of the Q6_K SDOT paths (Q8_K sums dropped) (matmul.rs:995-1003).
+quant::I8Blocks quantize_q6k_activations(std::span<const float> row, bool q8k) {
+    if (!q8k) return quant::quantize_row_to_i8_blocks(row);
+    auto r = quant::quantize_row_to_q8k(row);
+    return quant::I8Blocks{std::move(r.q), std::move(r.scales)};
+}
+#endif
+
+Result<Tensor> matmul_nt_q4_0(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % quant::QK != 0)
+        return tl::unexpected(
+            Error::internal("Q4_0 matmul_nt: k must be a multiple of the block size (32)"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / quant::QK * quant::Q4_0_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+    for (size_t i = 0; i < m; ++i)
+        gemv_parallel(std::span<float>(out).subspan(i * n, n),
+                      n,
+                      row_bytes,
+                      w_blocks,
+                      x_data.subspan(i * k, k),
+                      quant::dot_q4_0_row_f32);
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
+Result<Tensor> matmul_nt_q8_0(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % quant::QK != 0)
+        return tl::unexpected(
+            Error::internal("Q8_0 matmul_nt: k must be a multiple of the block size (32)"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / quant::QK * quant::Q8_0_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ── SDOT path (aarch64 dotprod): activations quantized to per-32 int8 ONCE per row ──
+    if (cpu_features::has_dotprod()) {
+        // Blocked W8A8 GEMM (m ≥ 8: prefill / vision towers): all rows quantize once, ONE parallel
+        // region over weight-row chunks, output built [n, m] then flipped. Same kernel, same
+        // scales as the per-row path → bit-identical (matmul.rs:608-650).
+        if (m >= 8) {
+            const size_t bpr = k / quant::QK; // activation blocks per row
+            std::vector<int8_t> x_i8(m * k, 0);
+            std::vector<float> x_scales(m * bpr, 0.0f);
+            parallel::par_for(m, [&](size_t i) {
+                const auto r = quant::quantize_row_to_i8_blocks(x_data.subspan(i * k, k));
+                std::copy(
+                    r.q.begin(), r.q.end(), x_i8.begin() + static_cast<std::ptrdiff_t>(i * k));
+                std::copy(r.scales.begin(),
+                          r.scales.end(),
+                          x_scales.begin() + static_cast<std::ptrdiff_t>(i * bpr));
+            });
+            std::vector<float> out_t(n * m, 0.0f); // [n, m]
+            const size_t wchunk = detail::gemv_chunk(n);
+            parallel::par_chunks_mut(out_t, wchunk * m, [&](size_t ci, std::span<float> oc) {
+                const size_t j0 = ci * wchunk;
+                for (size_t jl = 0; jl * m < oc.size(); ++jl) { // oc.chunks_mut(m)
+                    const size_t j = j0 + jl;
+                    const auto wrow = w_blocks.subspan(j * row_bytes, row_bytes);
+                    for (size_t i = 0; i < m; ++i)
+                        oc[jl * m + i] = quant::dot_q8_0_row_sdot(
+                            wrow,
+                            std::span<const int8_t>(x_i8).subspan(i * k, k),
+                            std::span<const float>(x_scales).subspan(i * bpr, bpr));
+                }
+            });
+            // Transpose [n, m] → [m, n] (parallel over output rows).
+            parallel::par_chunks_mut(out, n, [&](size_t i, std::span<float> orow) {
+                for (size_t j = 0; j < orow.size(); ++j)
+                    orow[j] = out_t[j * m + i];
+            });
+            return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+        }
+        for (size_t i = 0; i < m; ++i) {
+            // Per-block activation scales — a single per-row scale is destroyed by outlier
+            // activation channels and yields incoherent output.
+            const auto xq = quant::quantize_row_to_i8_blocks(x_data.subspan(i * k, k));
+            const size_t chunk = detail::gemv_chunk(n);
+            detail::for_each_out_chunk(
+                std::span<float>(out).subspan(i * n, n),
+                chunk,
+                [&](size_t ci, std::span<float> cs) {
+                    for (size_t local = 0; local < cs.size(); ++local) {
+                        const size_t j = ci * chunk + local;
+                        cs[local] = quant::dot_q8_0_row_sdot(
+                            w_blocks.subspan(j * row_bytes, row_bytes), xq.q, xq.scales);
+                    }
+                });
+        }
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+#endif
+    // ── Fallback: NEON widening or AVX2 ──
+    for (size_t i = 0; i < m; ++i)
+        gemv_parallel(std::span<float>(out).subspan(i * n, n),
+                      n,
+                      row_bytes,
+                      w_blocks,
+                      x_data.subspan(i * k, k),
+                      quant::dot_q8_0_row_f32);
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
+// Q4_K_R4 (row-interleaved) GEMV: weight rows come in groups of 4 whose super-blocks are
+// block-interleaved into one contiguous stream (matmul.rs:711-860).
+Result<Tensor> matmul_nt_q4_k_r4(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % 256 != 0 || n % 4 != 0)
+        return tl::unexpected(
+            Error::internal("Q4_K_R4: k must be a multiple of 256 and rows a multiple of 4"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / 256 * quant::Q4_K_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const size_t group_bytes = 4 * row_bytes;
+    // ── i8mm SMMLA prefill path (m ≥ 2, ARMv8.6): two activation rows per pass through each
+    // weight group; output built group-major (transposed) so tasks own contiguous chunks ──
+    if (m >= 2 && cpu_features::has_i8mm()) {
+        const bool q8k = detail::q8k_activations();
+        std::vector<quant::Q8kRow> quantized;
+        quantized.reserve(m);
+        for (size_t i = 0; i < m; ++i)
+            quantized.push_back(quantize_q4k_activations(x_data.subspan(i * k, k), q8k));
+        const size_t groups = n / 4;
+        std::vector<float> out_t(n * m, 0.0f); // [group-rows][m]
+        parallel::par_chunks_mut(out_t, 4 * m, [&](size_t g, std::span<float> chunk) {
+            const auto group = w_blocks.subspan(g * group_bytes, group_bytes);
+            size_t xi = 0;
+            while (xi + 2 <= m) {
+                const auto& a = quantized[xi];
+                const auto& b = quantized[xi + 1];
+                const auto v = q8k ? quant::dot_q4_k_4rows_r4_x2_q8k_smmla(
+                                         group, a.q, a.scales, a.sums, b.q, b.scales, b.sums)
+                                   : quant::dot_q4_k_4rows_r4_x2_smmla(
+                                         group, a.q, a.scales, a.sums, b.q, b.scales, b.sums);
+                for (size_t r = 0; r < 4; ++r) {
+                    chunk[r * m + xi] = v[r][0];
+                    chunk[r * m + xi + 1] = v[r][1];
+                }
+                xi += 2;
+            }
+            if (xi < m) {
+                const auto& a = quantized[xi];
+                const auto v = q8k ? quant::dot_q4_k_4rows_r4_q8k_neon(group, a.q, a.scales, a.sums)
+                                   : quant::dot_q4_k_4rows_r4_neon(group, a.q, a.scales, a.sums);
+                for (size_t r = 0; r < 4; ++r)
+                    chunk[r * m + xi] = v[r];
+            }
+        });
+        for (size_t g = 0; g < groups; ++g)
+            for (size_t r = 0; r < 4; ++r)
+                for (size_t i = 0; i < m; ++i)
+                    out[i * n + g * 4 + r] = out_t[(g * 4 + r) * m + i];
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+
+    // ── SDOT decode path: one contiguous stream per 4-row group ──
+    if (cpu_features::has_dotprod()) {
+        const bool q8k = detail::q8k_activations();
+        for (size_t i = 0; i < m; ++i) {
+            const auto xq = quantize_q4k_activations(x_data.subspan(i * k, k), q8k);
+            const size_t gchunk = std::max<size_t>(detail::gemv_chunk(n) / 4, 1);
+            detail::for_each_out_chunk(
+                std::span<float>(out).subspan(i * n, n),
+                gchunk * 4,
+                [&](size_t ci, std::span<float> cs) {
+                    const size_t g0 = ci * gchunk;
+                    for (size_t gl = 0; gl * 4 < cs.size(); ++gl) { // cs.chunks_mut(4)
+                        const size_t g = g0 + gl;
+                        const auto group = w_blocks.subspan(g * group_bytes, group_bytes);
+                        const auto v =
+                            q8k ? quant::dot_q4_k_4rows_r4_q8k_neon(group, xq.q, xq.scales, xq.sums)
+                                : quant::dot_q4_k_4rows_r4_neon(group, xq.q, xq.scales, xq.sums);
+                        const auto slots =
+                            cs.subspan(gl * 4, std::min<size_t>(4, cs.size() - gl * 4));
+                        std::copy_n(v.begin(), slots.size(), slots.begin());
+                    }
+                });
+        }
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+#endif
+    // Portable fallback (tests / x86): de-interleave each group's rows and use the scalar W4A8
+    // dot — per-32 activations, never Q8_K (matmul.rs:841-859).
+    for (size_t i = 0; i < m; ++i) {
+        const auto xq = quant::quantize_row_to_i8_blocks(x_data.subspan(i * k, k));
+        const auto x_sums = quant::i8_block_sums(xq.q);
+        const size_t nb = k / 256;
+        std::vector<uint8_t> row_buf(row_bytes, 0);
+        for (size_t g = 0; g < n / 4; ++g)
+            for (size_t r = 0; r < 4; ++r) {
+                for (size_t b = 0; b < nb; ++b) {
+                    const size_t src = (g * 4 * nb + b * 4 + r) * quant::Q4_K_BLOCK_BYTES;
+                    std::copy_n(w_blocks.data() + src,
+                                quant::Q4_K_BLOCK_BYTES,
+                                row_buf.data() + b * quant::Q4_K_BLOCK_BYTES);
+                }
+                out[i * n + g * 4 + r] =
+                    quant::dot_q4_k_row_q8_scalar(row_buf, xq.q, xq.scales, x_sums);
+            }
+    }
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
+Result<Tensor> matmul_nt_q4_k(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % 256 != 0) return tl::unexpected(Error::internal("Q4_K: k must be a multiple of 256"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / 256 * quant::Q4_K_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ── W4A8 SDOT path: 4 weight rows share one pass over the activations; remainder rows use
+    // the single-row kernel (per-row results bit-identical either way) (matmul.rs:879-929) ──
+    if (cpu_features::has_dotprod()) {
+        const bool q8k = detail::q8k_activations();
+        for (size_t i = 0; i < m; ++i) {
+            const auto xq = quantize_q4k_activations(x_data.subspan(i * k, k), q8k);
+            const size_t chunk = detail::gemv_chunk(n);
+            detail::for_each_out_chunk(
+                std::span<float>(out).subspan(i * n, n),
+                chunk,
+                [&](size_t ci, std::span<float> cs) {
+                    const size_t start = ci * chunk;
+                    size_t local = 0;
+                    while (local + 4 <= cs.size()) {
+                        const size_t j = start + local;
+                        const std::array<std::span<const uint8_t>, 4> rows = {
+                            w_blocks.subspan(j * row_bytes, row_bytes),
+                            w_blocks.subspan((j + 1) * row_bytes, row_bytes),
+                            w_blocks.subspan((j + 2) * row_bytes, row_bytes),
+                            w_blocks.subspan((j + 3) * row_bytes, row_bytes)};
+                        const auto v =
+                            q8k ? quant::dot_q4_k_4rows_q8k_neon(rows, xq.q, xq.scales, xq.sums)
+                                : quant::dot_q4_k_4rows_q8_neon(rows, xq.q, xq.scales, xq.sums);
+                        std::copy_n(v.begin(), 4, cs.begin() + static_cast<std::ptrdiff_t>(local));
+                        local += 4;
+                    }
+                    for (; local < cs.size(); ++local) {
+                        const size_t j = start + local;
+                        const auto row = w_blocks.subspan(j * row_bytes, row_bytes);
+                        cs[local] =
+                            q8k ? quant::dot_q4_k_row_q8k_neon(row, xq.q, xq.scales, xq.sums)
+                                : quant::dot_q4_k_row_q8_neon(row, xq.q, xq.scales, xq.sums);
+                    }
+                });
+        }
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+#endif
+    for (size_t i = 0; i < m; ++i)
+        gemv_parallel(std::span<float>(out).subspan(i * n, n),
+                      n,
+                      row_bytes,
+                      w_blocks,
+                      x_data.subspan(i * k, k),
+                      quant::dot_q4_k_row_f32);
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
+Result<Tensor> matmul_nt_q5_k(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % 256 != 0) return tl::unexpected(Error::internal("Q5_K: k must be a multiple of 256"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / 256 * quant::Q5_K_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+    // No SIMD/dotprod branch at all — Rust has none for Q5_K.
+    for (size_t i = 0; i < m; ++i)
+        gemv_parallel(std::span<float>(out).subspan(i * n, n),
+                      n,
+                      row_bytes,
+                      w_blocks,
+                      x_data.subspan(i * k, k),
+                      quant::dot_q5_k_row_f32);
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
+// Q6_K_R4 (row-interleaved) GEMV — same scheme as matmul_nt_q4_k_r4 (matmul.rs:971-1109).
+Result<Tensor> matmul_nt_q6_k_r4(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % 256 != 0 || n % 4 != 0)
+        return tl::unexpected(
+            Error::internal("Q6_K_R4: k must be a multiple of 256 and rows a multiple of 4"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / 256 * quant::Q6_K_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const size_t group_bytes = 4 * row_bytes;
+    // ── i8mm SMMLA prefill path (m ≥ 2) ──
+    if (m >= 2 && cpu_features::has_i8mm()) {
+        const bool q8k = detail::q8k_activations();
+        std::vector<quant::I8Blocks> quantized;
+        quantized.reserve(m);
+        for (size_t i = 0; i < m; ++i)
+            quantized.push_back(quantize_q6k_activations(x_data.subspan(i * k, k), q8k));
+        const size_t groups = n / 4;
+        std::vector<float> out_t(n * m, 0.0f); // [group-rows][m]
+        parallel::par_chunks_mut(out_t, 4 * m, [&](size_t g, std::span<float> chunk) {
+            const auto group = w_blocks.subspan(g * group_bytes, group_bytes);
+            size_t xi = 0;
+            while (xi + 2 <= m) {
+                const auto& a = quantized[xi];
+                const auto& b = quantized[xi + 1];
+                const auto v =
+                    q8k ? quant::dot_q6_k_4rows_r4_x2_q8k_smmla(group, a.q, a.scales, b.q, b.scales)
+                        : quant::dot_q6_k_4rows_r4_x2_smmla(group, a.q, a.scales, b.q, b.scales);
+                for (size_t r = 0; r < 4; ++r) {
+                    chunk[r * m + xi] = v[r][0];
+                    chunk[r * m + xi + 1] = v[r][1];
+                }
+                xi += 2;
+            }
+            if (xi < m) {
+                const auto& a = quantized[xi];
+                const auto v = q8k ? quant::dot_q6_k_4rows_r4_q8k_neon(group, a.q, a.scales)
+                                   : quant::dot_q6_k_4rows_r4_q8_neon(group, a.q, a.scales);
+                for (size_t r = 0; r < 4; ++r)
+                    chunk[r * m + xi] = v[r];
+            }
+        });
+        for (size_t g = 0; g < groups; ++g)
+            for (size_t r = 0; r < 4; ++r)
+                for (size_t i = 0; i < m; ++i)
+                    out[i * n + g * 4 + r] = out_t[(g * 4 + r) * m + i];
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+
+    // ── NEON decode path: W6A8/Q8_K when dotprod is present, f32 activations otherwise ──
+    {
+        const bool dotprod = cpu_features::has_dotprod();
+        for (size_t i = 0; i < m; ++i) {
+            const auto x_row = x_data.subspan(i * k, k);
+            const bool q8k = detail::q8k_activations();
+            std::optional<quant::I8Blocks> quantized;
+            if (dotprod) quantized = quantize_q6k_activations(x_row, q8k);
+            const size_t gchunk = std::max<size_t>(detail::gemv_chunk(n) / 4, 1);
+            detail::for_each_out_chunk(
+                std::span<float>(out).subspan(i * n, n),
+                gchunk * 4,
+                [&](size_t ci, std::span<float> cs) {
+                    const size_t g0 = ci * gchunk;
+                    for (size_t gl = 0; gl * 4 < cs.size(); ++gl) {
+                        const size_t g = g0 + gl;
+                        const auto group = w_blocks.subspan(g * group_bytes, group_bytes);
+                        std::array<float, 4> v{};
+                        if (quantized.has_value())
+                            v = q8k ? quant::dot_q6_k_4rows_r4_q8k_neon(
+                                          group, quantized->q, quantized->scales)
+                                    : quant::dot_q6_k_4rows_r4_q8_neon(
+                                          group, quantized->q, quantized->scales);
+                        else
+                            v = quant::dot_q6_k_4rows_r4_neon(group, x_row); // f32 activations
+                        const auto slots =
+                            cs.subspan(gl * 4, std::min<size_t>(4, cs.size() - gl * 4));
+                        std::copy_n(v.begin(), slots.size(), slots.begin());
+                    }
+                });
+        }
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+#else
+    // Portable fallback (Rust's #[allow(unreachable_code)] block): de-interleave each group and
+    // use the f32 dot (matmul.rs:1090-1108).
+    for (size_t i = 0; i < m; ++i) {
+        const auto x_row = x_data.subspan(i * k, k);
+        const size_t nb = k / 256;
+        std::vector<uint8_t> row_buf(row_bytes, 0);
+        for (size_t g = 0; g < n / 4; ++g)
+            for (size_t r = 0; r < 4; ++r) {
+                for (size_t b = 0; b < nb; ++b) {
+                    const size_t src = (g * 4 * nb + b * 4 + r) * quant::Q6_K_BLOCK_BYTES;
+                    std::copy_n(w_blocks.data() + src,
+                                quant::Q6_K_BLOCK_BYTES,
+                                row_buf.data() + b * quant::Q6_K_BLOCK_BYTES);
+                }
+                out[i * n + g * 4 + r] = quant::dot_q6_k_row_f32(row_buf, x_row);
+            }
+    }
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+#endif
+}
+
+Result<Tensor> matmul_nt_q6_k(const Tensor& x, const Tensor& w, size_t m, size_t k, size_t n) {
+    if (k % 256 != 0) return tl::unexpected(Error::internal("Q6_K: k must be a multiple of 256"));
+    const auto x_cow = x.to_f32_cow();
+    const auto x_data = x_cow.get();
+    const auto w_blocks = w.quant_blocks();
+    const size_t row_bytes = k / 256 * quant::Q6_K_BLOCK_BYTES;
+    check_quant_operands(x_data, w_blocks, m, k, n, row_bytes);
+    std::vector<float> out(m * n, 0.0f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ── W6A8 SDOT path: one `sdot` per 16-element scale group (matmul.rs:1126-1153) ──
+    if (cpu_features::has_dotprod()) {
+        const bool q8k = detail::q8k_activations();
+        for (size_t i = 0; i < m; ++i) {
+            const auto xq = quantize_q6k_activations(x_data.subspan(i * k, k), q8k);
+            const size_t chunk = detail::gemv_chunk(n);
+            detail::for_each_out_chunk(
+                std::span<float>(out).subspan(i * n, n),
+                chunk,
+                [&](size_t ci, std::span<float> cs) {
+                    for (size_t local = 0; local < cs.size(); ++local) {
+                        const size_t j = ci * chunk + local;
+                        const auto row = w_blocks.subspan(j * row_bytes, row_bytes);
+                        cs[local] = q8k ? quant::dot_q6_k_row_q8k_neon(row, xq.q, xq.scales)
+                                        : quant::dot_q6_k_row_q8_neon(row, xq.q, xq.scales);
+                    }
+                });
+        }
+        return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+    }
+#endif
+    for (size_t i = 0; i < m; ++i)
+        gemv_parallel(std::span<float>(out).subspan(i * n, n),
+                      n,
+                      row_bytes,
+                      w_blocks,
+                      x_data.subspan(i * k, k),
+                      quant::dot_q6_k_row_f32);
+    return Tensor::from_f32_vec(std::move(out), Shape{m, n});
+}
+
 } // namespace
 
 namespace detail {
@@ -230,6 +715,17 @@ void for_each_out_chunk(std::span<float> out,
     // `if (spinpool::enabled()) { spinpool::pool().run(n_chunks, …); return; }` — same partition.
     parallel::par_chunks_mut(out, chunk, f);
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+bool q8k_activations() {
+    // OnceLock twin: SAPIENT_Q8K_ACT read once; `v != "0"`, unset → true (matmul.rs:458-470).
+    static const bool on = [] {
+        const char* v = std::getenv("SAPIENT_Q8K_ACT");
+        return v == nullptr || std::string_view(v) != "0";
+    }();
+    return on;
+}
+#endif
 
 } // namespace detail
 
@@ -300,16 +796,19 @@ Result<Tensor> matmul_nt(const Tensor& x, const Tensor& w) {
 
     switch (w.dtype()) {
     case DType::Q4_0:
+        return matmul_nt_q4_0(x, w, m, k, n);
     case DType::Q8_0:
+        return matmul_nt_q8_0(x, w, m, k, n);
     case DType::Q4_K:
+        return matmul_nt_q4_k(x, w, m, k, n);
     case DType::Q4_K_R4:
+        return matmul_nt_q4_k_r4(x, w, m, k, n);
     case DType::Q5_K:
+        return matmul_nt_q5_k(x, w, m, k, n);
     case DType::Q6_K:
+        return matmul_nt_q6_k(x, w, m, k, n);
     case DType::Q6_K_R4:
-        // PLAN D: matmul_nt_q4_0 / q8_0 / q4_k / q4_k_r4 / q5_k / q6_k / q6_k_r4 replace this arm.
-        return tl::unexpected(Error::internal("matmul_nt: quantized weights (" +
-                                              sapient::core::to_string(w.dtype()) +
-                                              ") land in plan D"));
+        return matmul_nt_q6_k_r4(x, w, m, k, n);
     default:
         return matmul_nt_float(x, w, m, k, n);
     }

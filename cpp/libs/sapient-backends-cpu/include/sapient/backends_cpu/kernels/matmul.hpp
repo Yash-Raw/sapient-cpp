@@ -3,8 +3,9 @@
 #pragma once
 // Port of crates/sapient-backends/cpu/src/kernels/matmul.rs. Plan C: `matmul`, the `matmul_nt`
 // dispatcher with its FLOAT paths (F16 GEMV bit-surgery, f32 GEMV, sgemm prefill row blocks),
-// `gemm`, `gemv_chunk`, `for_each_out_chunk`. Plan D adds the seven quantized arms (today they
-// return an explicit Error); plan E adds the spin-pool branch of `for_each_out_chunk`.
+// `gemm`, `gemv_chunk`, `for_each_out_chunk`. Plan D added the seven quantized arms
+// (Q4_0/Q8_0/Q4_K/Q4_K_R4/Q5_K/Q6_K/Q6_K_R4 with Rust's runtime dispatch); plan E adds the
+// spin-pool branch of `for_each_out_chunk`.
 
 #include <cstddef>
 #include <functional>
@@ -22,7 +23,7 @@ using sapient::core::Tensor;
 Result<Tensor> matmul(const Tensor& a, const Tensor& b);
 
 /// Linear projection x [M, K] · Wᵀ with W stored [N, K] (PyTorch nn.Linear layout) → [M, N].
-/// Dispatches on W's dtype without expanding quantized weights (plan D); float weights take the
+/// Dispatches on W's dtype without expanding quantized weights; float weights take the
 /// F16 GEMV (m == 1, k ≥ 64, F16), the f32 GEMV (m == 1, k ≥ 512) or the blocked sgemm path.
 Result<Tensor> matmul_nt(const Tensor& x, const Tensor& w);
 
@@ -45,6 +46,13 @@ size_t gemv_chunk(size_t n);
 void for_each_out_chunk(std::span<float> out,
                         size_t chunk,
                         const std::function<void(size_t, std::span<float>)>& f);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// Rust `q8k_activations()`: `SAPIENT_Q8K_ACT != "0"`, read ONCE per process (OnceLock twin),
+/// default true — the Q8_K (per-256) activation format for the Q4_K/Q6_K SDOT/SMMLA paths;
+/// `SAPIENT_Q8K_ACT=0` reverts to the per-32 W4A8/W6A8 format. aarch64-only, as in Rust.
+bool q8k_activations();
+#endif
 } // namespace detail
 
 } // namespace sapient::backends_cpu::kernels::matmul
