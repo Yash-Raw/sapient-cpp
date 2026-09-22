@@ -65,7 +65,7 @@ module with the same stem, GoogleTests under `tests/` with the Rust test names.
 | `kernels/rope.hpp/.cpp` | `rope.rs` | `apply_rope`, `apply_rope_partial`, `apply_rope_partial_scaled`, `rope_cos_sin_cache`; `powf` + `sinf`/`cosf` from the platform libm (same libm as Rust on each OS). |
 | `kernels/elementwise.hpp/.cpp` | `elementwise.rs` | Unary/binary helpers with the scalar-broadcast rule; all activations; `erf_approx` = the Abramowitz–Stegun polynomial verbatim (never `std::erff`). |
 | `kernels/softmax`, `reduce`, `layernorm`, `conv2d` | same | Sequential f32 sums in the Rust order; conv2d's im2col + out-channel-block GEMM (sgemm; max-error gated) + the two `std::atomic<uint64_t>` timing counters. |
-| `spinpool.hpp/.cpp` | `spinpool.rs` | Direct port: `OpSlot`, `alignas(128) Pad<T>`, `std::atomic` with the same orderings, `std::mutex`/`std::condition_variable` (Rust used std, not parking_lot), worker threads named `sapient-spin-N`, macOS `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` for workers and (once per thread) publishers, the seqlock protocol (generation ODD **before** draining `active`), guided block claiming with the per-OS block-size rule, `run()` serial fast paths, process-lifetime singleton `pool()`, `parallelism()`, `enabled()` = env/platform default AND `thermal::effective_threads() >= parallel::num_threads()`. Env: `SAPIENT_SPINPOOL`, `_WORKERS`, `_SPINS` (default 4000), `_BLOCK`, `_DEBUG`. |
+| `spinpool.hpp/.cpp` | `spinpool.rs` | Direct port: `OpSlot`, `alignas(128) Pad<T>`, `std::atomic` with the same orderings, `std::mutex`/`std::condition_variable` (Rust used std, not parking_lot), worker threads named `sapient-spin-N`, macOS `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` for workers and (once per thread) publishers, the seqlock protocol (generation ODD **before** draining `active`), guided block claiming with the per-OS block-size rule, `run()` serial fast paths, process-lifetime singleton `pool()`, `parallelism()`, `enabled()` = env/platform default AND `thermal::effective_threads() >= parallel::num_threads()`. Env: `SAPIENT_SPINPOOL`, `_WORKERS`, `_SPINS` (default 4000), `_BLOCK`, `_DEBUG`. **As built (plan E), two approved deviations:** `run` is a `template <class F>` over an erased core (`thunk<F>`), not `std::function` — Rust's `run<F: Fn(usize)+Sync>` builds the equivalent `OpSlot{call: thunk::<F>, ctx: …}` by hand, and a `std::function` parameter would heap-allocate the `for_each_out_chunk` lambda on every GEMV, exactly the per-dispatch cost the pool exists to remove; and Windows worker-thread naming is omitted by ruling: macOS/Linux get Rust's `sapient-spin-{w}` names via `pthread_setname_np`, but Windows is compile-only in CI, `SetThreadDescription`'s availability depends on the SDK's `NTDDI_VERSION`, and a thread name is a debugging aid with no behavioural or parity role — so the `#else` arm is an explicitly-commented no-op rather than a construct nobody here can compile-test (costs if wrong: Windows debuggers show unnamed threads; real-hardware coverage of the whole pool route is macOS arm64 only regardless, see `docs/PARITY.md`). |
 | `thermal.hpp/.cpp` | `thermal.rs` | `ThermalGovernor` (sorted `thermal_zone*/temp` files under a root, hysteresis 80/70 °C, floor `max/2`, one-shot warning), external level cap (0..3 → full/¾/½/¼, floor 1), `effective_threads()` = stricter of the two, `tick()` rate-limited to 500 ms with the compare-exchange winner sampling. Env: `SAPIENT_THERMAL`, `_PATH`, `_HOT`, `_COOL`. Uses `std::filesystem`. |
 
 Kernel env knobs are read exactly where Rust reads them (per-call vs `OnceLock`-cached), with
@@ -128,6 +128,16 @@ the same defaults — see the kernels porting map §2.10.
   knob-sensitive cases carry a `_q8k_off` suffix, consumed by a second ctest entry with that
   environment; the D suite also carries plan C's odd-length carry-over cases
   (`matmul_nt_f32_m1_k519`, `matmul_nt_f16_m1_k67`, `attention_decode_hd10`).
+  **As built (plan E):** the gate landed as **two ctest entries** — `sapient_backends_cpu_tests.
+  spinpool_on` (`SAPIENT_SPINPOOL=1;SAPIENT_THERMAL=off`) and `.spinpool_off`
+  (`SAPIENT_SPINPOOL=0`) — each re-running plan D's existing `Golden*`/`GoldenQuant*` dumps
+  (minus the twelve `_q8k_off` cases, which stay under plan D's own entry) in a different
+  process environment, plus **two route probes** (`Spinpool.route_is_{on,off}_under_env`,
+  gated into each entry's filter and covered by `FAIL_REGULAR_EXPRESSION "spinpool route
+  probe"` so a silently-inapplied `ENVIRONMENT` fails the entry instead of passing vacuously).
+  **No new dump cases and no Rust changes were needed** — plan E changes *how* the CPU kernels
+  dispatch their GEMVs, not what they compute, so the existing dumps are the correct oracle for
+  both routes.
 - **Hosts.** macOS arm64 locally (NEON/dotprod/i8mm on Apple M-series); x86_64 scalar/AVX2 and
   Windows only via the CI `cpp-parity`/`cpp-build-windows` jobs.
 - **Rust untouched** except `dump_kernels.rs` extensions (each plan lists its additions).
@@ -139,7 +149,7 @@ the same defaults — see the kernels porting map §2.10.
 | **A: core** | §2.1 entirely; `dump_kernels` dequant cases | 22 core tests by name; dequant golden bit-identical | CLAUDE.md sp1a section, ROADMAP row 1a progress, PARITY.md rows |
 | **C: dense kernels** | `cpu_features`, `parallel`, `sgemm`, `matmul` float paths + dispatcher skeleton, `attention`, `rope`, `elementwise`, `softmax`, `reduce`, `layernorm`, `conv2d` | 26 dense tests + 5 float matmul tests by name; golden dense cases bit-identical, sgemm cases max-error | same |
 | **D: quant kernels** | `kernels/quant` (all ISA paths), quant arms of `matmul_nt`, R4 repack, Q8_K | 24 quant + 5 quant matmul tests (incl. the two `to_bits` gates); all quant golden cases bit-identical on arm64 (CI: x86_64) | same |
-| **E: spinpool + thermal** | `spinpool`, `thermal`, `tick()` wiring, `enabled()`, `for_each_out_chunk` pool branch | 5+1 spinpool and 6 thermal tests; D golden suite pool-on == pool-off | same |
+| **E: spinpool + thermal** | `spinpool`, `thermal`, `tick()` wiring, `enabled()`, `for_each_out_chunk` pool branch | 5+1 spinpool and 6 thermal tests; D golden suite pool-on == pool-off | **satisfied 2026-09-22** — see `docs/PARITY.md` sub-project 1a Results; same doc set as A/C/D |
 | **B: io** | §2.2 entirely | 2 io tests; synthetic GGUF/safetensors tests; `SAPIENT_TEST_GGUF` heap-vs-mmap byte check | same, plus PROJECT_GUIDE §6 note |
 
 Branch: `feat/cpp-sp1a`, stacked on `feat/cpp-sp0-scaffold` (unpushed; the user pushes).

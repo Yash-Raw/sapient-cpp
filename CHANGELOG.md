@@ -22,6 +22,10 @@ section below as the GitHub release body.
 - `cpp/libs/sapient-backends-cpu`: `kernels/quant` ported 1:1 (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K dots, int8 + Q8_K activation quantisers, NEON/SDOT/SMMLA and R4 kernels, repacks) with all 24 Rust tests; `matmul_nt` gains its seven quantized arms with Rust's runtime dispatch (5 Rust tests incl. the two bit-identity gates). 20 new golden cases plus a second `SAPIENT_Q8K_ACT=0` dump pass (75 dumps total) — every quantized case bit-identical to the Rust oracle on arm64.
 - Test-only Rust: `dump_kernels` gains the plan-D cases and a `--q8k-off` mode. No product behaviour change. Recorded in `docs/PARITY.md`: a dormant out-of-bounds read in the Rust AVX2 Q8_0 row dot (zero lanes; no effect on finite inputs), which the port replaces with an in-bounds load.
 
+### 🧱 C++ rewrite — sub-project 1a, plan E (sapient::backends_cpu spin pool + thermal governor)
+- `cpp/libs/sapient-backends-cpu`: real ports of the decode-hot-path support modules — `thermal` (`ThermalGovernor`: sysfs hysteresis 80/70 °C, floor `max/2`, external 4-level mobile cap) and `spinpool` (the seqlock op-handoff worker pool: guided topology-aware block claiming, macOS QoS pinning) — replacing plan C's stub signatures, with all 6 thermal + 5 spinpool Rust tests ported by name (incl. the `rapid_ops_with_constant_parking` stress reproducer and the `#[ignore]` probe as `DISABLED_pool_speedup_probe`).
+- `matmul::detail::for_each_out_chunk` now dispatches through the spin pool whenever `spinpool::enabled()`, instead of unconditionally through the rayon stand-in; both routes are gated bit-identical to the Rust golden dumps (two new ctest entries re-running plan D's existing dumps with the pool on and off — no new dump cases, no Rust changes). Library-internal only: no new build step, dependency or user-facing surface.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**

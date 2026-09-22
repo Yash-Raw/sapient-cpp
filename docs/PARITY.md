@@ -34,6 +34,32 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
   helpers yet. — **closed by plan A (`compare.hpp`)**: `sapient::testing::{bit_identical,
   max_abs_err, within_abs, SAPIENT_GOLDEN_CASE}`.
 
+### Gaps closed and opened by plan E (spinpool + thermal)
+
+- Plan C landed `thermal`/`spinpool` as **inert stubs** matching plan E's signatures — the
+  types existed and `gemv_chunk` already consulted `enabled()`/`parallelism()`, but nothing
+  was real: no sysfs governor, no worker threads, and `for_each_out_chunk` dispatched
+  unconditionally through `parallel::par_chunks_mut`, never through a pool — **closed by plan
+  E**: `ThermalGovernor` and `SpinPool` are full ports of `thermal.rs`/`spinpool.rs`, and
+  `for_each_out_chunk` now branches on `spinpool::enabled()` — both routes proven bit-identical
+  (see Results below).
+
+New gaps opened by plan E, recorded honestly:
+
+- The spin pool's non-macOS behaviour is **compile-verified only**. `spinpool::enabled()`
+  defaults to off on x86_64 and on Windows, so CI's Linux/Windows jobs exercise the
+  `parallel::par_chunks_mut` route, not the pool; the pool's non-macOS arms (thread-naming
+  omission, the non-macOS `SAPIENT_SPINPOOL_BLOCK` default) were probe-built with
+  `-DSAPIENT_TARGET_MACOS=0` on this host but never executed, and the `__linux__` arms cannot
+  even be compiled here. Real-hardware coverage of the pool route is macOS arm64 only, until a
+  Linux/aarch64 runner exists.
+- `SAPIENT_SPINPOOL_BLOCK`'s non-macOS default (`n_chunks / (3 · participants)`, the
+  homogeneous-server-ARM block size) never executes on this host for the same reason.
+- **No performance claim is made or measured.** `Spinpool.DISABLED_pool_speedup_probe` exists
+  (ported from Rust's `#[ignore] pool_speedup_probe`) but gates nothing — it is not part of any
+  ctest entry's filter. Spec §2.3/§7 and the programme spec explicitly defer performance past
+  sub-project 1a.
+
 ### Known oracle defects the port reproduces on purpose
 
 | Found | Where (Rust) | Defect | Port | Status |
@@ -53,7 +79,12 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
 | 2026-09-21 | 24 quant + 5 quant-matmul backends-cpu unit tests ported by name (+ C++-only pins of the `as`-cast/`roundf`/`fmaxf` rules, the seven guard texts, repack death tests) | macOS arm64 (Apple M5; NEON/dotprod/i8mm) | — | `b93f5fb` | pass |
 | 2026-09-21 | Quantized golden cases: `quantize_q{4,8}_0_block`, `dot_q{4,8}_0_row_f32`, `dot_q{4,5,6}_k_row_f32`, `quantize_row_to_i8_blocks`, `i8_block_sums`, `quantize_row_to_q8k`, `repack_q{4,6}_k_rows4`, `matmul_nt_{q8_0_m{1,3,8},q4_0_m{1,3},q5_k_m1,q4_k_m{1,3},q6_k_m{1,3},q4_k_r4_m{1,2,3,8},q6_k_r4_m{1,2,3,8}}` (default `SAPIENT_Q8K_ACT`) and the twelve `_q8k_off` twins (`SAPIENT_Q8K_ACT=0`) vs the Rust kernels | macOS arm64 (Apple M5; NEON/dotprod/i8mm) | `b93f5fb` | `b93f5fb` | bit-identical, 42/42 (30 default-env + 12 knob-off) |
 | 2026-09-21 | Odd-length dense cases `matmul_nt_f32_m1_k519`, `matmul_nt_f16_m1_k67`, `attention_decode_hd10` (SIMD body + scalar tail) | macOS arm64 | `b93f5fb` | `b93f5fb` | bit-identical, 3/3 |
-| 2026-09-21 | x86_64 (scalar K-quants, AVX2 Q8_0) and Windows | CI `cpp-parity` (ubuntu) / `cpp-build-windows` | — | — | not yet run — first push of the stacked branches |
+| 2026-09-22 | sp1a plan E — spinpool/thermal unit tests: 6 `Thermal.*` + 5 `Spinpool.*` Rust tests ported by name (incl. `rapid_ops_with_constant_parking`, the SIGSEGV drain-order reproducer), 1 Rust `#[ignore]` probe ported as `Spinpool.DISABLED_pool_speedup_probe`; 2 new C++-only route probes (`Spinpool.route_is_{on,off}_under_env`) exist solely so the pool-on/pool-off ctest entries are non-vacuous | macOS arm64 (Apple M5) | 39742bf | c01f5a5 | pass — `cargo test -p sapient-backends-cpu`: 71 passed; 0 failed; 1 ignored; C++ registers the same 11 ported names + the 2 route probes, all pass (probe DISABLED, not run) |
+| 2026-09-22 | sp1a plan E — golden suite, pool ON: `GoldenKernels.*` + `GoldenQuant.*` (54 cases — 24 plan-C dense + 30 plan-D quant, excluding the twelve `_q8k_off` cases which need their own `SAPIENT_Q8K_ACT=0` process; plan A's 9 core dequant dumps run under a separate ctest entry, not this one) plus `Spinpool.route_is_on_under_env`, under `SAPIENT_SPINPOOL=1;SAPIENT_THERMAL=off`, ctest entry `sapient_backends_cpu_tests.spinpool_on` | macOS arm64 (Apple M5; NEON/dotprod/i8mm) | 39742bf | c01f5a5 | bit-identical to the Rust dumps — pass, 55/55 `[ OK ]` (`ctest --preset dev -R 'spinpool_on$' -V \| grep -c '\[ *OK *\]'` with `SAPIENT_GOLDEN_DIR` set: 54 golden comparisons + the route probe). No new dump cases and no Rust changes: the gate re-runs plan D's existing dumps with the CPU GEMVs routed through the spin pool instead of `parallel::par_chunks_mut`. Anti-vacuous guard independently verified: removing `SAPIENT_SPINPOOL=1` from the entry's `ENVIRONMENT` makes it fail on the `FAIL_REGULAR_EXPRESSION "spinpool route probe"` text, which appears in the binary's output exactly twice (only in the two route probes' skip messages) |
+| 2026-09-22 | sp1a plan E — golden suite, pool OFF: same 54 cases + `Spinpool.route_is_off_under_env`, under `SAPIENT_SPINPOOL=0`, ctest entry `sapient_backends_cpu_tests.spinpool_off` | macOS arm64 (Apple M5; NEON/dotprod/i8mm) | 39742bf | c01f5a5 | bit-identical to the Rust dumps — pass, 55/55 `[ OK ]` (same count and method as pool ON). Pool-on == pool-off == Rust: the spin pool and `parallel::par_chunks_mut` produce the identical `(chunk index → [start, end))` partition, so switching the route changes nothing observable |
+| 2026-09-22 | sp1a plan E — stress: `Spinpool.rapid_ops_with_constant_parking` (the seqlock drain-order SIGSEGV reproducer) × 20 consecutive runs | macOS arm64 (Apple M5) | 39742bf | c01f5a5 | clean — 20/20 consecutive runs, no crash |
+| 2026-09-22 | sp1a plan E — independent review: atomic-ordering audit (all 18 atomic operations in `spinpool.cpp` tabulated against `spinpool.rs`) + ThreadSanitizer probe build (4 runs: 400 rounds of the park/wake stress shape, plus 4 concurrent publishers × 40 ops × 37 chunks) | macOS arm64 (Apple M5) | 39742bf | c01f5a5 | 18/18 orderings match; TSan: 0 reports across 4 runs |
+| 2026-09-21 | x86_64 (scalar K-quants, AVX2 Q8_0) and Windows | CI `cpp-parity` (ubuntu) / `cpp-build-windows` | — | — | not yet run — first push of the stacked branches; plan E's pool route is additionally untested there (see gaps above) |
 
 ## Sub-project 1b — CPU chat vertical slice
 
