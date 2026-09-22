@@ -46,15 +46,41 @@ Conventions: **bit-identical** = byte-equal output; **token-identical** = equal 
 
 New gaps opened by plan E, recorded honestly:
 
-- The spin pool's non-macOS behaviour is **compile-verified only**. `spinpool::enabled()`
-  defaults to off on x86_64 and on Windows, so CI's Linux/Windows jobs exercise the
-  `parallel::par_chunks_mut` route, not the pool; the pool's non-macOS arms (thread-naming
-  omission, the non-macOS `SAPIENT_SPINPOOL_BLOCK` default) were probe-built with
-  `-DSAPIENT_TARGET_MACOS=0` on this host but never executed, and the `__linux__` arms cannot
-  even be compiled here. Real-hardware coverage of the pool route is macOS arm64 only, until a
-  Linux/aarch64 runner exists.
-- `SAPIENT_SPINPOOL_BLOCK`'s non-macOS default (`n_chunks / (3 · participants)`, the
-  homogeneous-server-ARM block size) never executes on this host for the same reason.
+- **The bit-identity claim for the two golden ctest entries (`spinpool_on`/`spinpool_off`) is
+  measured only over a degenerate partition.** `SpinPool::run` has a serial fast path: when
+  `n_chunks == 1` it runs the callback inline on the caller and never touches the publish mutex,
+  the seqlock handoff, `execute_blocks`, the workers, or the completion barrier
+  (`spinpool.cpp:191-195`). Every golden `matmul_nt` case has `n ∈ {8, 16}`, and `gemv_chunk`
+  floors its chunk size at 16 on all three branches (`matmul.cpp:699-709`, including the R4
+  sites, which pass `gchunk*4 == 16`) — so every gated golden dispatch has `n_chunks == 1`. This
+  was measured, not inferred: running the `spinpool_on` filter with
+  `SAPIENT_SPINPOOL_DEBUG=1 --gtest_repeat=400` emits only
+  `[spinpool-debug] spin=2000 rayon=0 chunk=16 len=8 n_chunks=1` (and its 4000/6000/8000 twins) —
+  `rayon=0` proves the pool route was taken, `n_chunks=1` proves the partition was degenerate. So
+  the two golden entries prove route *selection* and result identity over the one-chunk
+  partition; they do not exercise the pool's parallel machinery (multi-chunk claiming, the
+  seqlock handoff, worker wake/park). That machinery genuinely IS gated elsewhere, on every
+  platform regardless of `enabled()`: the `Spinpool.*` unit tests drive `pool.run` directly with
+  up to 61 chunks, 4 concurrent publishers, and constant park/wake
+  (`Spinpool.rapid_ops_with_constant_parking` on its own `create(4, 50)` pool); and
+  `Matmul.matmul_nt_q8_0_gguf_dimflip_matches_float` (`matmul_test.cpp:329-347`,
+  `out_features = 64`) dispatches `chunk=16 len=64 n_chunks=4` through the pool under the ambient
+  macOS default — a gate-strength and record gap, not a coverage hole.
+- **The spin pool's *default-on* configuration and macOS-only mechanisms are macOS arm64 only;
+  the pool route itself is exercised on every CI target.** The env override beats the platform
+  default everywhere: a non-null `SAPIENT_SPINPOOL` short-circuits the `#if` platform block
+  entirely (`spinpool.cpp:275-276`), and the `spinpool_on` ctest entry sets
+  `SAPIENT_SPINPOOL=1` (`CMakeLists.txt:47`) — so `cpp-test-linux`, `cpp-build-windows`, and
+  both `cpp-parity` legs run that entry through the pool too, spawning real workers, and on
+  Linux executing the `__linux__` `pthread_setname_np` arm (`spinpool.cpp:83-85`). The
+  `Spinpool.*` unit tests reach the non-macOS block-size arm the same way: they call
+  `pool.run(n, …)` with `n` up to 61 on every platform, so on a Linux runner they execute
+  `default_block = max(n_chunks / (3 · participants), 1)` (`spinpool.cpp:230`). What genuinely
+  IS macOS-arm64-only is the *default-on* configuration (`enabled()` returning true with no env
+  var set) and `pin_qos_user_interactive` (`spinpool.cpp:66-70`). `SAPIENT_SPINPOOL_BLOCK`'s
+  non-macOS default (`n_chunks / (3 · participants)`, the homogeneous-server-ARM block size)
+  still never executes *on this host* — this Mac cannot compile the `__linux__` arm at all, and
+  without an explicit `SAPIENT_SPINPOOL_BLOCK` override the macOS branch always takes `block = 1`.
 - **No performance claim is made or measured.** `Spinpool.DISABLED_pool_speedup_probe` exists
   (ported from Rust's `#[ignore] pool_speedup_probe`) but gates nothing — it is not part of any
   ctest entry's filter. Spec §2.3/§7 and the programme spec explicitly defer performance past
