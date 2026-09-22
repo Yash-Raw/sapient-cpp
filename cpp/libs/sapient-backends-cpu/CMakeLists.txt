@@ -28,4 +28,29 @@ if(SAPIENT_BUILD_TESTS)
   set_tests_properties(sapient_backends_cpu_tests.q8k_off PROPERTIES
                         ENVIRONMENT "SAPIENT_Q8K_ACT=0"
                         FAIL_REGULAR_EXPRESSION "needs SAPIENT_Q8K_ACT=0")
+
+  # `spinpool::enabled()` is a once-per-process read (Rust OnceLock twin), so the pool-on and
+  # pool-off halves of plan E's gate need their own processes. Both run the FULL golden suite: the
+  # float GEMV arms of matmul_nt route through for_each_out_chunk too, not just the quantized ones.
+  # The `_q8k_off` cases are excluded — they belong to the q8k_off entry's environment.
+  #
+  # Unlike q8k_off, a non-applied ENVIRONMENT property here would fail SILENTLY (the suite would
+  # run on the ambient default and still be bit-identical), so each entry also runs a route probe
+  # that skips with the text "spinpool route probe" unless its variable is set — and that text is
+  # what FAIL_REGULAR_EXPRESSION rejects.
+  add_test(NAME sapient_backends_cpu_tests.spinpool_on
+           COMMAND sapient_backends_cpu_tests
+                   "--gtest_filter=Golden*.*:Spinpool.route_is_on_under_env-GoldenQuant.*_q8k_off")
+  # SAPIENT_THERMAL=off keeps the route assertion deterministic on a Linux runner with real
+  # thermal zones: a hot box would shed a core and flip enabled() to false mid-run.
+  set_tests_properties(sapient_backends_cpu_tests.spinpool_on PROPERTIES
+                        ENVIRONMENT "SAPIENT_SPINPOOL=1;SAPIENT_THERMAL=off"
+                        FAIL_REGULAR_EXPRESSION "spinpool route probe")
+
+  add_test(NAME sapient_backends_cpu_tests.spinpool_off
+           COMMAND sapient_backends_cpu_tests
+                   "--gtest_filter=Golden*.*:Spinpool.route_is_off_under_env-GoldenQuant.*_q8k_off")
+  set_tests_properties(sapient_backends_cpu_tests.spinpool_off PROPERTIES
+                        ENVIRONMENT "SAPIENT_SPINPOOL=0"
+                        FAIL_REGULAR_EXPRESSION "spinpool route probe")
 endif()

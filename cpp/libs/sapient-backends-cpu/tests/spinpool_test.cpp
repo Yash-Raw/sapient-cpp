@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -148,4 +150,30 @@ TEST(Spinpool, rapid_ops_with_constant_parking) {
                 << "round " << round << " chunk " << c;
         }
     }
+}
+
+// ── Route probes: the anti-vacuous half of the pool-on/pool-off golden gate ─────────────────
+// These exist only so the two ctest entries below can prove their ENVIRONMENT property was
+// actually applied. Under the ambient environment they skip; the skip text is what
+// FAIL_REGULAR_EXPRESSION matches, so a silently-unset variable fails the entry instead of
+// passing it vacuously. Keep the phrase "spinpool route probe" in both texts and nowhere else.
+
+TEST(Spinpool, route_is_on_under_env) {
+    const char* v = std::getenv("SAPIENT_SPINPOOL");
+    if (v == nullptr || std::string_view(v) != "1") {
+        GTEST_SKIP() << "spinpool route probe: needs SAPIENT_SPINPOOL=1 in the environment (the "
+                        "sapient_backends_cpu_tests.spinpool_on ctest entry sets it)";
+    }
+    ASSERT_TRUE(spinpool::enabled())
+        << "SAPIENT_SPINPOOL=1 must route for_each_out_chunk through the spin pool";
+}
+
+TEST(Spinpool, route_is_off_under_env) {
+    const char* v = std::getenv("SAPIENT_SPINPOOL");
+    if (v == nullptr || std::string_view(v) != "0") {
+        GTEST_SKIP() << "spinpool route probe: needs SAPIENT_SPINPOOL=0 in the environment (the "
+                        "sapient_backends_cpu_tests.spinpool_off ctest entry sets it)";
+    }
+    ASSERT_FALSE(spinpool::enabled())
+        << "SAPIENT_SPINPOOL=0 must route for_each_out_chunk through parallel::par_chunks_mut";
 }

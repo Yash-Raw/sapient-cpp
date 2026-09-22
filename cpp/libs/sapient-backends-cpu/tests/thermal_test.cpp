@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #include "sapient/backends_cpu/parallel.hpp"
@@ -131,6 +133,20 @@ TEST(Thermal, external_cap_mapping) {
 // parallelism. Serialized within this one test (the level is process-global); no other test in
 // this binary reads `effective_threads()`.
 TEST(Thermal, external_level_caps_effective_threads) {
+    // SAPIENT_THERMAL=off makes set_external_thermal_level() a no-op in both Rust and this port
+    // (thermal_disabled() short-circuits it) — the plan itself tells people to set this variable,
+    // so a red test under it would be a false alarm we authored, not a real regression.
+    const char* off = std::getenv("SAPIENT_THERMAL");
+    if (off != nullptr) {
+        const std::string_view s(off);
+        const auto lower = [](char c) {
+            return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        };
+        if (s.size() == 3 && lower(s[0]) == 'o' && lower(s[1]) == 'f' && lower(s[2]) == 'f') {
+            GTEST_SKIP() << "SAPIENT_THERMAL=off makes set_external_thermal_level a no-op (Rust "
+                            "does the same), so this test's premise is removed";
+        }
+    }
     const ExternalLevelGuard restore;
     const size_t max = std::max<size_t>(sapient::backends_cpu::parallel::num_threads(), 1);
     thermal::set_external_thermal_level(0);

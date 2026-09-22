@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -711,8 +713,55 @@ void for_each_out_chunk(std::span<float> out,
                         size_t chunk,
                         const std::function<void(size_t, std::span<float>)>& f) {
     if (out.empty()) return;
-    // PLAN E inserts here: the SAPIENT_SPINPOOL_DEBUG census and
-    // `if (spinpool::enabled()) { spinpool::pool().run(n_chunks, …); return; }` — same partition.
+    if (chunk == 0) sapient::core::panic("for_each_out_chunk: chunk size must not be zero");
+
+    // SAPIENT_SPINPOOL_DEBUG=1: periodic dispatch-route census on stderr (matmul.rs:493-516).
+    // Read via getenv on EVERY call, like Rust's uncached `std::env::var(..).is_ok()`.
+    if (std::getenv("SAPIENT_SPINPOOL_DEBUG") != nullptr) {
+        static std::atomic<uint64_t> spin_dispatches{0};
+        static std::atomic<uint64_t> pool_dispatches{0}; // the `RAYON` counter's twin
+        uint64_t s = 0;
+        uint64_t r = 0;
+        if (spinpool::enabled()) {
+            s = spin_dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
+            r = pool_dispatches.load(std::memory_order_relaxed);
+        } else {
+            s = spin_dispatches.load(std::memory_order_relaxed);
+            r = pool_dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        }
+        if ((s + r) % 2000 == 0) {
+            std::fprintf(stderr,
+                         "[spinpool-debug] spin=%llu rayon=%llu chunk=%zu len=%zu n_chunks=%zu\n",
+                         static_cast<unsigned long long>(s),
+                         static_cast<unsigned long long>(r),
+                         chunk,
+                         out.size(),
+                         (out.size() + chunk - 1) / chunk);
+        }
+    }
+
+    if (spinpool::enabled()) {
+        // Rust's SyncPtr: chunk geometry guarantees the spans built from `base` are disjoint, the
+        // same contract par_chunks_mut relies on, and `out` outlives `run` (it blocks until every
+        // chunk completes). The partition below is character-for-character the one in
+        // parallel::par_chunks_mut — that identity is what makes the two routes bit-identical.
+        const size_t len = out.size();
+        const size_t n_chunks = (len + chunk - 1) / chunk;
+        float* const base = out.data();
+        spinpool::pool().run(n_chunks, [&](size_t ci) {
+            const size_t start = ci * chunk;
+            const size_t end = std::min(start + chunk, len);
+            // A throwing callback would unwind through the pool's op slot (or std::terminate on a
+            // worker); abort cleanly instead, exactly as parallel::invoke does on the other route.
+            try {
+                f(ci, std::span<float>(base + start, end - start));
+            } catch (...) {
+                sapient::core::panic("for_each_out_chunk: a callback threw an exception "
+                                     "(callbacks must not throw)");
+            }
+        });
+        return;
+    }
     parallel::par_chunks_mut(out, chunk, f);
 }
 

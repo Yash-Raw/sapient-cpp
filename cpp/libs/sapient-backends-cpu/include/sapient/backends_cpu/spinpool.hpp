@@ -69,9 +69,11 @@ public:
     SpinPool& operator=(const SpinPool&) = delete;
 
     /// Execute `f(0..n_chunks)` in parallel across the pool + this thread. Returns after every
-    /// chunk has run. Chunks must write disjoint data. `f` must not throw (an escaping exception
-    /// aborts via `sapient::core::panic`, mirroring a Rust panic under `panic = "abort"`), and must
-    /// not itself call `run`.
+    /// chunk has run. Chunks must write disjoint data. `run` itself installs no exception handler:
+    /// an escaping exception is `std::terminate` on a worker, and on the publisher it would unwind
+    /// out of `run_erased` while workers may still be inside `execute_blocks` holding `op.ctx` — a
+    /// pointer into the frame being destroyed. `f` must therefore not throw; the in-tree caller
+    /// (`for_each_out_chunk`) is responsible for wrapping it. `f` must also not itself call `run`.
     template <class F> void run(size_t n_chunks, const F& f) {
         run_erased(n_chunks, &thunk<F>, static_cast<const void*>(&f));
     }

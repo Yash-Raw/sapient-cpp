@@ -4,8 +4,7 @@
 // Port of crates/sapient-backends/cpu/src/kernels/matmul.rs. Plan C: `matmul`, the `matmul_nt`
 // dispatcher with its FLOAT paths (F16 GEMV bit-surgery, f32 GEMV, sgemm prefill row blocks),
 // `gemm`, `gemv_chunk`, `for_each_out_chunk`. Plan D added the seven quantized arms
-// (Q4_0/Q8_0/Q4_K/Q4_K_R4/Q5_K/Q6_K/Q6_K_R4 with Rust's runtime dispatch); plan E adds the
-// spin-pool branch of `for_each_out_chunk`.
+// (Q4_0/Q8_0/Q4_K/Q4_K_R4/Q5_K/Q6_K/Q6_K_R4 with Rust's runtime dispatch).
 
 #include <cstddef>
 #include <functional>
@@ -42,7 +41,8 @@ namespace detail {
 /// every call) → max(n / (ncpus·tpc), 16); default clamp(n / (ncpus·4), 16, 512).
 size_t gemv_chunk(size_t n);
 /// Rust `for_each_out_chunk`: `f(ci, out[ci*chunk, min((ci+1)*chunk, len)))` for every chunk.
-/// Plan C runs the rayon-twin branch only; plan E adds the spin-pool branch (identical partition).
+/// Both routes — the spin pool when `spinpool::enabled()`, `parallel::par_chunks_mut` otherwise —
+/// produce the identical partition; that is what makes them bit-identical.
 void for_each_out_chunk(std::span<float> out,
                         size_t chunk,
                         const std::function<void(size_t, std::span<float>)>& f);
