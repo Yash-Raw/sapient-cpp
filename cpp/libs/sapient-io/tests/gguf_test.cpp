@@ -824,6 +824,24 @@ TEST(GgufTensors, wrapped_range_panics_like_rust_slice) {
     EXPECT_DEATH((void)GgufLoader::tensors_from_bytes(bytes), "slice index starts at");
 }
 
+// The mmap route's non-kept (converted) branch relies on `panic_on_wrap = !dtype.has_value()`
+// (gguf.cpp's `make_tensor_mmap`) to panic at LOAD time — same as the heap/bytes routes above —
+// rather than deferring to first read like the KEPT-dtype branch does
+// (`GgufTensorsDeferredMmapPanic` below). Pins existing behaviour via `load_tensors_mmap`
+// specifically (the other death test above only exercises the bytes route).
+TEST(GgufTensors, unkept_mmap_wrapped_range_panics_at_load) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TempDir dir("unkept_wrap"); // declared first → destroyed last (Windows: mapped-file delete)
+    GgufBuilder b;
+    b.tensor("w", {1}, 0, le_f32({1.0f})); // F32 is not a kept dtype
+    const auto probe = b.build();
+    const size_t ds = detail::parse_header(probe)->data_start;
+    b.tensors[0].offset_override = std::numeric_limits<uint64_t>::max() - 1 - ds;
+    const auto bytes = b.build();
+    const auto p = dir.write("uw.gguf", bytes);
+    EXPECT_DEATH((void)GgufLoader::load_tensors_mmap(p), "slice index starts at");
+}
+
 // ── File-level errors per entry point ────────────────────────────────────────────────────────
 TEST(GgufLoader, missing_file_is_model_not_found_everywhere) {
     TempDir dir("missing");
@@ -834,6 +852,29 @@ TEST(GgufLoader, missing_file_is_model_not_found_everywhere) {
     EXPECT_EQ(GgufLoader::load_tensors_with_metadata(p).error().to_string(), want);
     EXPECT_EQ(GgufLoader::load_tensors_mmap(p).error().to_string(), want);
     EXPECT_EQ(GgufLoader::parse_metadata_only(p).error().to_string(), want);
+}
+
+TEST(GgufLoader, nul_byte_in_path_is_model_not_found_everywhere) {
+    TempDir dir("nul_path");
+    // A real, valid GGUF at "nul.gguf" so a pre-fix `path.c_str()` truncation would silently open
+    // THIS (shorter) file instead of failing — the bug this test guards against.
+    GgufBuilder b;
+    b.tensor("w", {1}, 0, le_f32({1.0f}));
+    dir.write("nul.gguf", b.build());
+    const std::filesystem::path p = dir.path() / std::string("nul.gguf\0junk", 13);
+#if !defined(_WIN32)
+    const std::string want = "Model not found at path '" + sapient::io::display_path(p) +
+                             ": file name contained an unexpected NUL byte'";
+    EXPECT_EQ(GgufLoader::load_tensors(p).error().to_string(), want);
+    EXPECT_EQ(GgufLoader::load_tensors_with_metadata(p).error().to_string(), want);
+    EXPECT_EQ(GgufLoader::load_tensors_mmap(p).error().to_string(), want);
+    EXPECT_EQ(GgufLoader::parse_metadata_only(p).error().to_string(), want);
+#else
+    EXPECT_FALSE(GgufLoader::load_tensors(p).has_value());
+    EXPECT_FALSE(GgufLoader::load_tensors_with_metadata(p).has_value());
+    EXPECT_FALSE(GgufLoader::load_tensors_mmap(p).has_value());
+    EXPECT_FALSE(GgufLoader::parse_metadata_only(p).has_value());
+#endif
 }
 
 TEST(GgufLoader, empty_file_is_eof_on_every_entry_point) {
@@ -865,13 +906,12 @@ TEST(GgufLoader, directory_wrapping_per_entry_point) {
 }
 #endif
 
-// ═════════════════════════════════════ Fix round 1 ══════════════════════════════════════════
 // I1: dequantize_to_f32's F32/F16/BF16 arms must return Err (ShapeMismatch via Tensor::from_f32),
 // never abort, where Rust's wrapping-multiply range lands <= the byte slice — Rust only panics
 // when the wrapped range truly exceeds the slice. `numel * type_size` wraps the SAME way in
 // `tensor_byte_len`, so `raw`'s actual byte count always equals the wrapped `n` computed inside
 // `dequantize_to_f32` for these three cases; the mismatch surfaces one level up, in `from_f32`.
-TEST(GgufTensorsFix1, wrapped_float_numel_is_shape_mismatch_not_abort) {
+TEST(GgufTensorsWrappedLength, wrapped_float_numel_is_shape_mismatch_not_abort) {
     struct Case {
         const char* name;
         detail::GgmlType kind;
@@ -915,7 +955,7 @@ TEST(GgufTensorsFix1, wrapped_float_numel_is_shape_mismatch_not_abort) {
     }
 }
 
-TEST(GgufTensorsFix1, dequantize_to_f32_f32_empty_is_empty_vector) {
+TEST(GgufTensorsWrappedLength, dequantize_to_f32_f32_empty_is_empty_vector) {
     const auto r = detail::dequantize_to_f32(detail::GgmlType::F32, {}, 0);
     ASSERT_TRUE(r.has_value()) << r.error().to_string();
     EXPECT_TRUE(r->empty());
@@ -924,7 +964,7 @@ TEST(GgufTensorsFix1, dequantize_to_f32_f32_empty_is_empty_vector) {
 // I2: make_tensor_mmap's KEPT branch (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) never slices at load time in
 // Rust — a wrapped data range that lands <= file size loads Ok, and the wrap panic is deferred
 // to the first read of the tensor's bytes (MmapBuffer::bytes()), not to load_tensors_mmap.
-TEST(GgufTensorsFix2, kept_mmap_wrapped_range_panics_on_first_read_not_load) {
+TEST(GgufTensorsDeferredMmapPanic, kept_mmap_wrapped_range_panics_on_first_read_not_load) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     TempDir dir(
         "keptwrap"); // declared first → destroyed last (Windows cannot delete a mapped file)

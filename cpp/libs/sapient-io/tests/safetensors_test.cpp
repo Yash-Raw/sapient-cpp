@@ -209,6 +209,30 @@ TEST(Safetensors, bom_prefixed_header_is_rejected) {
     EXPECT_NE(e, "<ok>") << e;
 }
 
+TEST(Safetensors, raw_nul_byte_in_header_is_rejected) {
+    // serde_json rejects a raw NUL byte anywhere in the header text; nlohmann 3.11.3's lexer
+    // instead treats it as end-of-input, so both of these parse Ok under nlohmann alone (0 tensors
+    // for the first, the valid one-tensor header for the second) — verified against real
+    // serde_json 1.0.150. Only the "Safetensors parse error: " prefix is parity-bound (the NUL
+    // rejection surfaces as an embedded serde_json message, exempt per the "Exempt" rule).
+    {
+        std::string header = "{}";
+        header.push_back('\0');
+        header += "garbage";
+        const auto e = err(st(header, {}));
+        EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
+        EXPECT_NE(e, "<ok>") << e;
+    }
+    {
+        std::string header = R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+        header.append(4, '\0');
+        const auto four = std::vector<uint8_t>(4, 0);
+        const auto e = err(st(header, four));
+        EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
+        EXPECT_NE(e, "<ok>") << e;
+    }
+}
+
 TEST(Safetensors, recursion_depth_at_limit_is_ok_beyond_limit_is_rejected) {
     // serde_json's recursion limit: the deepest nesting of `{`/`[` compounds (the root container
     // counts as depth 1) must stay <= 127; depth 128 is Err. Verified empirically against real
@@ -295,6 +319,22 @@ TEST(Safetensors, missing_file_and_directory) {
     EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
     EXPECT_NE(e.find("(os error "), std::string::npos) << e;
     EXPECT_EQ(e.find("mmap failed"), std::string::npos) << e;
+#endif
+}
+
+TEST(Safetensors, nul_byte_in_path_is_model_not_found) {
+    TempDir dir("st_nul_path");
+    // A real, valid safetensors file at "nul.safetensors" so a pre-fix `path.c_str()` truncation
+    // would silently open THIS file instead of failing (the bug this test guards against).
+    dir.write("nul.safetensors",
+              st(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})", le_f32({1.0f})));
+    const std::filesystem::path p = dir.path() / std::string("nul.safetensors\0junk", 20);
+    auto r = SafetensorsLoader::load(p);
+    ASSERT_FALSE(r.has_value());
+#if !defined(_WIN32)
+    EXPECT_EQ(r.error().to_string(),
+              "Model not found at path '" + sapient::io::display_path(p) +
+                  ": file name contained an unexpected NUL byte'");
 #endif
 }
 

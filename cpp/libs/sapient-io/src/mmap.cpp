@@ -40,6 +40,28 @@ tl::unexpected<MapError> map_failure(MapStage stage, OsError os) {
     return tl::unexpected(MapError{stage, std::move(os)});
 }
 
+/// Rust's `File::open`/`fs::read` convert the path to the OS call's native string type before
+/// issuing any syscall — on POSIX via `CString::new`, on Windows via a UTF-16 conversion — and
+/// both reject an embedded NUL byte up front with a fixed `io::ErrorKind::InvalidInput` error
+/// (not a raw OS errno, so its Display has no "(os error N)" suffix). `path.c_str()` has no such
+/// check: for a `path` whose internal representation contains a NUL (constructible in C++ from a
+/// `std::string`/`std::wstring` with an embedded NUL, unlike a real OS path), it silently returns
+/// a pointer that a C API reads only up to the first NUL — opening a different, shorter path
+/// instead of failing. Check for the NUL ourselves before any syscall so this never happens.
+std::optional<OsError> nul_in_path_error(const std::filesystem::path& path) {
+    const auto& native = path.native();
+#if defined(_WIN32)
+    // Rust std's Windows text for this case (io/error/repr_bitpacked.rs's INVALID_INPUT path via
+    // sys::args::to_u16s); not parity-bound (Windows OS texts are exempt).
+    if (native.find(L'\0') != std::filesystem::path::string_type::npos)
+        return OsError{0, "strings passed to WinAPI cannot contain NULs"};
+#else
+    if (native.find('\0') != std::filesystem::path::string_type::npos)
+        return OsError{0, "file name contained an unexpected NUL byte"};
+#endif
+    return std::nullopt;
+}
+
 #if !defined(_WIN32)
 // Rust's File::open retries open(2) on EINTR (cvt_r). O_CLOEXEC as Rust sets it.
 int open_readonly(const std::filesystem::path& path) {
@@ -62,6 +84,7 @@ std::string display_path(const std::filesystem::path& path) {
 
 tl::expected<std::shared_ptr<const MappedFile>, MapError>
 MappedFile::open(const std::filesystem::path& path) {
+    if (const auto err = nul_in_path_error(path)) return map_failure(MapStage::Open, *err);
     // Rust File::open on Windows: GENERIC_READ, share read|write|delete, OPEN_EXISTING.
     HANDLE file = ::CreateFileW(path.c_str(),
                                 GENERIC_READ,
@@ -105,6 +128,7 @@ MappedFile::~MappedFile() {
 }
 
 tl::expected<std::vector<uint8_t>, OsError> read_file(const std::filesystem::path& path) {
+    if (const auto err = nul_in_path_error(path)) return tl::unexpected(*err);
     HANDLE file = ::CreateFileW(path.c_str(),
                                 GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -133,6 +157,7 @@ tl::expected<std::vector<uint8_t>, OsError> read_file(const std::filesystem::pat
 
 tl::expected<std::shared_ptr<const MappedFile>, MapError>
 MappedFile::open(const std::filesystem::path& path) {
+    if (const auto err = nul_in_path_error(path)) return map_failure(MapStage::Open, *err);
     const int fd = open_readonly(path);
     if (fd < 0) return map_failure(MapStage::Open, last_os_error());
     struct stat st {};
@@ -164,6 +189,7 @@ MappedFile::~MappedFile() {
 }
 
 tl::expected<std::vector<uint8_t>, OsError> read_file(const std::filesystem::path& path) {
+    if (const auto err = nul_in_path_error(path)) return tl::unexpected(*err);
     const int fd = open_readonly(path);
     if (fd < 0) return tl::unexpected(last_os_error());
     std::vector<uint8_t> out;

@@ -71,6 +71,33 @@ TEST(Mmap, directory_fails_at_map_stage) {
     EXPECT_EQ(m.error().os.message, sapient::io::rust_std::os_error_message(m.error().os.code));
 }
 
+TEST(Mmap, nul_byte_in_path_fails_at_open_stage) {
+    TempDir dir("nul_path");
+    // A real, valid file at "nul.gguf" so a pre-fix `path.c_str()` truncation would silently open
+    // THIS (shorter) file instead of failing — the bug this test guards against.
+    dir.write("nul.gguf", pattern(8));
+    const std::filesystem::path poisoned = dir.path() / std::string("nul.gguf\0junk", 13);
+    auto m = MappedFile::open(poisoned);
+    ASSERT_FALSE(m.has_value());
+    EXPECT_EQ(m.error().stage, MapStage::Open);
+#if !defined(_WIN32)
+    EXPECT_EQ(m.error().os.code, 0);
+    EXPECT_EQ(m.error().os.message, "file name contained an unexpected NUL byte");
+#endif
+}
+
+TEST(ReadFile, nul_byte_in_path_fails) {
+    TempDir dir("nul_path_read");
+    dir.write("nul.bin", pattern(8));
+    const std::filesystem::path poisoned = dir.path() / std::string("nul.bin\0junk", 12);
+    auto r = sapient::io::read_file(poisoned);
+    ASSERT_FALSE(r.has_value());
+#if !defined(_WIN32)
+    EXPECT_EQ(r.error().code, 0);
+    EXPECT_EQ(r.error().message, "file name contained an unexpected NUL byte");
+#endif
+}
+
 TEST(Mmap, mapping_outlives_every_other_handle) {
     TempDir dir("outlives");
     const auto data = pattern(4096 + 17);

@@ -117,6 +117,19 @@ bool starts_with_bom(std::span<const uint8_t> header) {
     return header.size() >= 3 && header[0] == 0xEF && header[1] == 0xBB && header[2] == 0xBF;
 }
 
+/// serde_json's lexer rejects a raw NUL byte anywhere in the header text — U+0000 is illegal
+/// wherever it appears in JSON, so serde always returns an `Err` ("trailing characters at line 1
+/// column N", the exact wording depending on position). nlohmann 3.11.3's lexer instead treats a
+/// raw `\0` as end-of-input: `{}\0garbage` parses `Ok` (0 tensors) and a valid header padded with
+/// trailing `\0` bytes also parses `Ok`. Verified against real serde_json 1.0.150. Reject any
+/// embedded NUL ourselves before handing the header to nlohmann; the message text itself is not
+/// parity-bound (it is the tail of an embedded serde_json error — see the "Exempt" rule).
+bool contains_nul(std::span<const uint8_t> header) {
+    for (const uint8_t c : header)
+        if (c == 0) return true;
+    return false;
+}
+
 /// serde_json's default (non "unbounded_depth") build enforces a recursion limit: the deepest
 /// nesting of `{`/`[` compounds, counting the outermost container as depth 1, must stay <= 127 —
 /// depth 128 is `Err("recursion limit exceeded …")`. Verified empirically against real
@@ -193,6 +206,7 @@ core::Result<TensorMap> SafetensorsLoader::from_bytes(std::span<const uint8_t> b
         core::panic("slice index starts at 8 but ends at " + std::to_string(header_end));
     const auto header = bytes.subspan(8, header_len);
     if (auto e = rust_std::utf8_error(header)) return tl::unexpected(st_err(*e));
+    if (contains_nul(header)) return tl::unexpected(st_err("trailing characters"));
     if (starts_with_bom(header)) return tl::unexpected(st_err("expected value at line 1 column 1"));
     if (exceeds_recursion_limit(header)) return tl::unexpected(st_err("recursion limit exceeded"));
 
