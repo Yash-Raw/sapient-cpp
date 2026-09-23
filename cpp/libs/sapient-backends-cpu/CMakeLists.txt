@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
+# Port of crates/sapient-backends/cpu (sub-project 1a plans C/D/E). `parallel` stands in for rayon,
+# `sgemm` for matrixmultiply, `cpu_features` for is_*_feature_detected!.
+find_package(Threads REQUIRED)
+add_library(sapient_backends_cpu STATIC
+  src/cpu_features.cpp src/parallel.cpp src/thermal.cpp src/spinpool.cpp src/sgemm.cpp src/kernels/elementwise.cpp src/kernels/softmax.cpp src/kernels/reduce.cpp src/kernels/layernorm.cpp src/kernels/rope.cpp src/kernels/attention.cpp src/kernels/conv2d.cpp src/kernels/matmul.cpp src/kernels/quant.cpp)
+add_library(sapient::backends_cpu ALIAS sapient_backends_cpu)
+target_include_directories(sapient_backends_cpu PUBLIC include)
+target_link_libraries(sapient_backends_cpu PUBLIC sapient::core Threads::Threads)
+sapient_apply_warnings(sapient_backends_cpu)
+
+if(SAPIENT_BUILD_TESTS)
+  add_executable(sapient_backends_cpu_tests
+    tests/cpu_features_test.cpp tests/parallel_test.cpp tests/sgemm_test.cpp tests/elementwise_test.cpp tests/softmax_test.cpp tests/reduce_test.cpp tests/layernorm_test.cpp tests/rope_test.cpp tests/attention_test.cpp tests/conv2d_test.cpp tests/matmul_test.cpp tests/quant_test.cpp tests/golden_kernels_test.cpp tests/golden_quant_test.cpp tests/thermal_test.cpp tests/spinpool_test.cpp)
+  target_link_libraries(sapient_backends_cpu_tests PRIVATE sapient::backends_cpu sapient::testing GTest::gtest_main)
+  sapient_apply_warnings(sapient_backends_cpu_tests)
+  gtest_discover_tests(sapient_backends_cpu_tests)
+
+  # The SAPIENT_Q8K_ACT knob is read once per process (Rust OnceLock twin), so the OFF setting
+  # needs its own ctest entry; the `GoldenQuant.*_q8k_off` gtests skip under the default env.
+  add_test(NAME sapient_backends_cpu_tests.q8k_off
+           COMMAND sapient_backends_cpu_tests --gtest_filter=GoldenQuant.*_q8k_off)
+  # Guard against the ENVIRONMENT property silently stopping application (e.g. a ctest/CMake
+  # regression): if the twelve `_q8k_off` cases ever run with the knob still ON, they GTEST_SKIP()
+  # with this exact text (golden_quant_test.cpp:76) instead of exercising the off path, and gtest
+  # exits 0 either way — so a vacuous pass must fail the ctest entry on the skip text itself.
+  set_tests_properties(sapient_backends_cpu_tests.q8k_off PROPERTIES
+                        ENVIRONMENT "SAPIENT_Q8K_ACT=0"
+                        FAIL_REGULAR_EXPRESSION "needs SAPIENT_Q8K_ACT=0")
+
+  # `spinpool::enabled()` is a once-per-process read (Rust OnceLock twin), so the pool-on and
+  # pool-off halves of plan E's gate need their own processes. Both run the FULL golden suite: the
+  # float GEMV arms of matmul_nt route through for_each_out_chunk too, not just the quantized ones.
+  # The `_q8k_off` cases are excluded — they belong to the q8k_off entry's environment.
+  #
+  # Unlike q8k_off, a non-applied ENVIRONMENT property here would fail SILENTLY (the suite would
+  # run on the ambient default and still be bit-identical), so each entry also runs a route probe
+  # that skips with the text "spinpool route probe" unless its variable is set — and that text is
+  # what FAIL_REGULAR_EXPRESSION rejects.
+  add_test(NAME sapient_backends_cpu_tests.spinpool_on
+           COMMAND sapient_backends_cpu_tests
+                   "--gtest_filter=Golden*.*:Spinpool.route_is_on_under_env-GoldenQuant.*_q8k_off")
+  # SAPIENT_THERMAL=off keeps the route assertion deterministic on a Linux runner with real
+  # thermal zones: a hot box would shed a core and flip enabled() to false mid-run.
+  set_tests_properties(sapient_backends_cpu_tests.spinpool_on PROPERTIES
+                        ENVIRONMENT "SAPIENT_SPINPOOL=1;SAPIENT_THERMAL=off"
+                        FAIL_REGULAR_EXPRESSION "spinpool route probe")
+
+  add_test(NAME sapient_backends_cpu_tests.spinpool_off
+           COMMAND sapient_backends_cpu_tests
+                   "--gtest_filter=Golden*.*:Spinpool.route_is_off_under_env-GoldenQuant.*_q8k_off")
+  set_tests_properties(sapient_backends_cpu_tests.spinpool_off PROPERTIES
+                        ENVIRONMENT "SAPIENT_SPINPOOL=0"
+                        FAIL_REGULAR_EXPRESSION "spinpool route probe")
+endif()

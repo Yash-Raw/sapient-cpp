@@ -8,7 +8,14 @@ results/
 # Mobile packaging output (scripts/package-{swift,android}.sh)
 dist/
 .DS_Store
+/Testing/
 
 # Gradle state from the android-maven publishing scaffold
 scripts/android-maven/.gradle/
 scripts/android-maven/build/
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Superpowers SDD scratch (ledgers, briefs, review packages)
+.superpowers/

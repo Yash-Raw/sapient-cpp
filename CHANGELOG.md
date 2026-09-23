@@ -3,6 +3,34 @@
 Release notes for SAPIENT. The release workflow publishes each version's
 section below as the GitHub release body.
 
+## [Unreleased]
+
+### 🧱 C++ rewrite — sub-project 0 (scaffold + oracle harness)
+- `cpp/` CMake tree (C++20, Clang-only, `-ffp-contract=off`), GoogleTest, presets, CI jobs `cpp-*`.
+- Rust→C++ oracle harness: test-only `dump_kernels` (`.sapd` golden dumps) and `greedy_ids` examples, `sapient::testing` reader, `greedy_parity.sh`, SPDX and WGSL shader-sync gates, `docs/PARITY.md` ledger.
+- Rust tree: two behaviour-identical clippy-1.98 lint fixes (scheduler `mem::take`; targeted `result_large_err` allow in the CLI server) so the workspace clippy gate stays green on current stable.
+- No user-facing behaviour change; the Rust binaries are unaffected.
+
+### 🧱 C++ rewrite — sub-project 1a, plan A (sapient::core)
+- `cpp/libs/sapient-core`: Tensor/DType/Shape/Buffer/Error ported 1:1 with all 22 Rust tests, software f16/bf16, the shared dequantiser, tl::expected-based Result; 9 golden dequant cases bit-identical to the Rust oracle.
+
+### 🧱 C++ rewrite — sub-project 1a, plan C (sapient::backends_cpu dense kernels)
+- `cpp/libs/sapient-backends-cpu`: attention, RoPE, LayerNorm/RMSNorm, softmax, reductions, element-wise ops, conv2d and the float matmul paths ported 1:1 with all 31 Rust tests; rayon stand-in (`parallel`), ISA probes, own SGEMM; `-fno-math-errno` joins the parity flags; 12 new golden cases (43 total) — 17 dense cases bit-identical, 4 SGEMM-backed within tolerance.
+- Test-only Rust: `dump_kernels` gains the 12 dense cases. No product behaviour change. Recorded in `docs/PARITY.md`: a dormant defect in the Rust NEON F16 GEMV (negative f16 weights mis-decoded ×2^32), which the port reproduces on purpose.
+
+### 🧱 C++ rewrite — sub-project 1a, plan D (sapient::backends_cpu quantized kernels)
+- `cpp/libs/sapient-backends-cpu`: `kernels/quant` ported 1:1 (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K dots, int8 + Q8_K activation quantisers, NEON/SDOT/SMMLA and R4 kernels, repacks) with all 24 Rust tests; `matmul_nt` gains its seven quantized arms with Rust's runtime dispatch (5 Rust tests incl. the two bit-identity gates). 20 new golden cases plus a second `SAPIENT_Q8K_ACT=0` dump pass (75 dumps total) — every quantized case bit-identical to the Rust oracle on arm64.
+- Test-only Rust: `dump_kernels` gains the plan-D cases and a `--q8k-off` mode. No product behaviour change. Recorded in `docs/PARITY.md`: a dormant out-of-bounds read in the Rust AVX2 Q8_0 row dot (zero lanes; no effect on finite inputs), which the port replaces with an in-bounds load.
+
+### 🧱 C++ rewrite — sub-project 1a, plan E (sapient::backends_cpu spin pool + thermal governor)
+- `cpp/libs/sapient-backends-cpu`: real ports of the decode-hot-path support modules — `thermal` (`ThermalGovernor`: sysfs hysteresis 80/70 °C, floor `max/2`, external 4-level mobile cap) and `spinpool` (the seqlock op-handoff worker pool: guided topology-aware block claiming, macOS QoS pinning) — replacing plan C's stub signatures, with all 6 thermal + 5 spinpool Rust tests ported by name (incl. the `rapid_ops_with_constant_parking` stress reproducer and the `#[ignore]` probe as `DISABLED_pool_speedup_probe`).
+- `matmul::detail::for_each_out_chunk` now dispatches through the spin pool whenever `spinpool::enabled()`, instead of unconditionally through the rayon stand-in; both routes are gated bit-identical to the Rust golden dumps (two new ctest entries re-running plan D's existing dumps with the pool on and off — no new dump cases, no Rust changes). Library-internal only: no new build step, dependency or user-facing surface.
+
+### 🧱 C++ rewrite — sub-project 1a, plan B (sapient::io GGUF + safetensors loaders)
+- `cpp/libs/sapient-io`: the GGUF header parser, all three GGUF tensor-loading paths (heap, mmap, metadata-only) with Q5_0→Q8_0 requantisation, and the safetensors JSON loader ported 1:1, with the 2 Rust tests ported by name plus 72 C++-only synthetic-file tests (76 total) and an env-gated real-file byte-diff check verified against four real HF-cached models. Every `Result`-path error text is byte-identical to the Rust oracle, generated from a live Rust probe rather than recalled; third-party addition nlohmann/json 3.11.3 for the safetensors header.
+- Final-review fix wave: safetensors JSON header parsing now rejects a raw embedded NUL byte the way `serde_json` does (nlohmann's lexer otherwise treats `\0` as end-of-input and silently accepts a truncated or padded header); every GGUF/safetensors loader entry point now rejects a path containing an embedded NUL byte before issuing any syscall, matching Rust's `File::open`/`fs::read` (`path.c_str()` would otherwise silently truncate to, and open, a different, shorter path). 6 new tests (`GgufTensorsWrappedLength`/`GgufTensorsDeferredMmapPanic` — renamed from the process-history `GgufTensorsFix1`/`GgufTensorsFix2` — plus the new NUL-header/NUL-path/mmap-route death-test coverage).
+- Library-internal only: no user-facing surface change (the C++ binary isn't wired up yet — that's sub-project 1b). Sub-project 1a is complete.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**

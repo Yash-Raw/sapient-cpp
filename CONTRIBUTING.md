@@ -570,6 +570,22 @@ Do **not** use `raw.githubusercontent.com/.../main/install.sh` in user-facing do
 
 ---
 
+## C++ rewrite programme (in progress)
+
+The workspace is being ported to C++ (`cpp/`, C++20 + CMake, Clang) as a behavioural-parity conversion; the Rust `crates/` remain the correctness oracle until the port is complete. Before contributing to either tree, read `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`:
+
+- **Rust tree:** behaviour is frozen (bug fixes only, each mirrored in C++); do not change kernel numerics without updating the parity records.
+- **C++ tree:** follow the mirroring conventions (same crate/module/test names, same env knobs, `-ffp-contract=off`, no `-march=native`), keep the SPDX header on every file, and land each change with its parity-gate result in `docs/PARITY.md`.
+- **C++ build/test/lint (sub-project 0 is in):** prerequisites are CMake ≥ 3.24, Ninja and **Clang** (Apple clang, clang ≥ 16, or clang-cl on Windows — GCC/MSVC are refused unless `-DSAPIENT_ALLOW_NON_CLANG=ON`, and such builds are not parity builds). Then:
+
+  ```bash
+  cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev
+  just cpp-fmt      # clang-format in place (CI runs --dry-run --Werror; the pre-push hook does too)
+  just cpp-lint     # SPDX header gate on cpp/ and crates/, WGSL shader-sync gate
+  ```
+
+  Kernel golden gates need dumps from the Rust oracle **made on your machine**: `just cpp-golden /tmp/sapient-golden` then `SAPIENT_GOLDEN_DIR=/tmp/sapient-golden just cpp-test`. Never commit dump files. Every new C++ source file carries the SPDX header (the `lint.spdx_headers` ctest fails otherwise), lives under `cpp/libs/sapient-<crate>/` mirroring the Rust module it ports, and every parity result goes in `docs/PARITY.md`. clang-tidy is not part of Apple's toolchain — install it with `brew install llvm` to run `run-clang-tidy` locally; otherwise the CI `cpp-lint` job runs it. Formatting and tidy are checked with clang-format/clang-tidy **18** in CI (the canonical versions); `pip install clang-format==18.1.8 clang-tidy==18.1.8` in a venv gives you the same binaries locally. As an alternative to `brew install llvm`, the CI clang-tidy gate can also be run locally on macOS with the pinned clang-tidy 18 from `.superpowers/tools-venv`, passing `--extra-arg=-isysroot$(xcrun --show-sdk-path) --extra-arg=-nostdinc++ --extra-arg=-isystem<SDK>/usr/include/c++/v1` and keeping only findings under `cpp/libs/` (the SDK's libc++ is newer than clang 18, so SDK-header noise elsewhere is expected). When invoking `.githooks/pre-push` by hand, stage your edits first: the hook treats unstaged changes as formatter output and aborts.
+
 ## Getting help
 
 - **Bug reports & feature requests:** [GitHub Issues](https://github.com/SkidGod4444/sapient/issues)

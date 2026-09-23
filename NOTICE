@@ -59,5 +59,6 @@ the license requires you to:
   - prominently state any changes you made to the original files.
 
 This product bundles third-party open-source components, each distributed under
-its own license. Those licenses are listed in the dependency manifests
-(Cargo.toml / Cargo.lock) and retained in the respective upstream sources.
+its own license. Those licenses are listed in the dependency manifests — the Rust
+tree's Cargo.toml / Cargo.lock and the C++ tree's cpp/third_party/LICENSES.md —
+and retained in the respective upstream sources.

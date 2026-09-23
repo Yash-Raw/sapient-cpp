@@ -704,6 +704,10 @@ sapient-generate          ← Pipeline API — from_pretrained, generate, chat, 
 
 ---
 
+### C++ port (in progress)
+
+SAPIENT is being converted to C++ (`cpp/`) as a like-for-like port; the Rust crates stay as the correctness oracle until parity is complete. Binaries, CLI, HTTP API and SDKs keep the same names and behaviour. Design: [`docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`](docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md).
+
 ## Build from Source
 
 ```bash
@@ -717,6 +721,12 @@ cargo build -p sapient-cli --release --features mlx
 
 # Binary will be at:
 ./target/release/sapient
+```
+
+**C++ tree (parity port, in progress):**
+
+```bash
+cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # CMake ≥ 3.24, Ninja, Clang
 ```
 
 ---

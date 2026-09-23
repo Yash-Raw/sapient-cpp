@@ -208,3 +208,109 @@ jobs:
           npm ci
           npm run typecheck
           npm run bundle:check
+
+  # ── C++ tree (cpp/) — the Rust→C++ parity port ───────────────────────────────
+  cpp-lint:
+    name: C++ lint (format, tidy, SPDX, shader sync)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y ninja-build clang-18 clang-tidy-18 clang-tools-18 clang-format-18
+      - name: clang-format (dry run)
+        run: git ls-files -- 'cpp/*.hpp' 'cpp/*.cpp' 'cpp/*.h' 'cpp/*.mm' | xargs clang-format-18 --dry-run --Werror
+      - name: SPDX headers (cpp/ and crates/)
+        run: python3 cpp/scripts/check_spdx.py cpp crates
+      - name: Shader copies match Rust originals
+        run: python3 cpp/scripts/shader_sync.py .
+      - name: clang-tidy
+        working-directory: cpp
+        run: |
+          cmake --preset ci-linux -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+          run-clang-tidy-18 -clang-tidy-binary clang-tidy-18 -p build/ci-linux -quiet libs/
+
+  cpp-test-macos:
+    name: C++ build+test (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja
+      - working-directory: cpp
+        run: cmake --preset ci-macos && cmake --build --preset ci-macos && ctest --preset ci-macos
+
+  cpp-test-linux:
+    name: C++ build+test (Linux x86_64, clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y ninja-build clang
+      - working-directory: cpp
+        run: cmake --preset ci-linux && cmake --build --preset ci-linux && ctest --preset ci-linux
+
+  cpp-build-windows:
+    name: C++ build+test (Windows clang-cl)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: choco install ninja -y
+      - working-directory: cpp
+        run: cmake --preset ci-windows && cmake --build --preset ci-windows && ctest --preset ci-windows
+
+  # Builds BOTH languages on the same host: regenerates the kernel golden dumps there, runs the
+  # C++ tests against them, and greedy-diffs token ids. Until the C++ greedy tool lands
+  # (sub-project 1b) the token check is an explicit Rust-vs-Rust self-check.
+  cpp-parity:
+    name: Parity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, preset: ci-macos }
+          - { os: ubuntu-latest, preset: ci-linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ninja + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y ninja-build clang
+      - name: Install ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Build the Rust oracle tools
+        run: |
+          cargo build --release -p sapient-backends-cpu --example dump_kernels
+          cargo build --release -p sapient-generate --example greedy_ids
+      - name: Kernel golden dumps (this host)
+        run: cpp/tests/parity/golden_dump.sh "$RUNNER_TEMP/golden"
+      - name: Configure + build C++
+        working-directory: cpp
+        run: cmake --preset ${{ matrix.preset }} && cmake --build --preset ${{ matrix.preset }}
+      - name: C++ tests against the dumps
+        working-directory: cpp
+        env:
+          SAPIENT_GOLDEN_DIR: ${{ runner.temp }}/golden
+        run: ctest --preset ${{ matrix.preset }}
+      - name: Cache the parity model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-smollm2-135m-q4-${{ runner.os }}
+      - name: Greedy token parity (Rust self-check until the C++ tool exists)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: cpp/tests/parity/greedy_parity.sh --self-check --rust target/release/examples/greedy_ids --model smollm2-135m-q4 --max-new 32
+      - name: Real-file io check (GGUF heap vs mmap, plan B)
+        shell: bash
+        working-directory: cpp
+        run: |
+          GGUF=$(find ~/.cache/huggingface -iname '*smollm2-135m*.gguf' | head -1)
+          test -n "$GGUF" || { echo "parity model GGUF not found in the HF cache" >&2; exit 1; }
+          SAPIENT_TEST_GGUF="$GGUF" ctest --preset ${{ matrix.preset }} \
+            -R '^RealFile\.gguf_heap_and_mmap_agree$' -V | tee "$RUNNER_TEMP/realfile.log"
+          grep -q "\[real-file\]" "$RUNNER_TEMP/realfile.log"
+          if grep -q "SAPIENT_TEST_GGUF unset" "$RUNNER_TEMP/realfile.log"; then
+            echo "real-file test skipped" >&2
+            exit 1
+          fi

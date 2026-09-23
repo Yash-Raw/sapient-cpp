@@ -95,6 +95,10 @@ safe-testing ladder live in `docs/MOBILE.md`.
 
 ---
 
+### The C++ rewrite (started 2026-09-20)
+
+SAPIENT is being converted from Rust to C++ as a like-for-like port. Nothing about how it *works* changes — same quantized kernels, same engines, same commands — only the implementation language. The C++ code lives in `cpp/` next to the Rust `crates/`, and the Rust build stays as the "answer key" every C++ piece is checked against until the port is complete. The full design (what maps to what, in what order, and how each step is verified) is in `docs/superpowers/specs/2026-09-20-cpp-rewrite-design.md`. This guide's crate-by-crate sections (§4–§7) describe the Rust tree and will be rewritten for C++ in the final sub-project.
+
 ## 2. How does the parrot actually "think"? (still pretty simple)
 
 The parrot doesn't know words. It only knows **numbers**. So we play a translation game:
@@ -221,6 +225,8 @@ Knows how to open the file formats that store model brains.
 - `gguf.rs` — reads **GGUF** files, including **dequantizing** squished Q4/Q5/Q8 numbers back
   into normal numbers.
 - `onnx.rs` — reads **ONNX** model graphs (a cross-tool standard format).
+- The C++ port of the GGUF and safetensors loaders lives in `cpp/libs/sapient-io/` (sub-project
+  1a plan B); ONNX is deferred to sub-project 8.
 
 ### 🔤 `sapient-tokenizers` — words ↔ numbers
 Turns text into tokens and back, and formats chat conversations.
@@ -633,6 +639,10 @@ cargo build --release -p sapient-cli --features mlx
 ```
 
 Useful chat commands while chatting: `/help`, `/clear` (forget the conversation), `/exit`.
+
+### The C++ tree (in progress)
+
+The C++ port lives in `cpp/` and builds with CMake + Ninja + Clang: `cd cpp && cmake --preset dev && cmake --build --preset dev && ctest --preset dev`. Sub-project 0 landed the scaffolding and the "answer-key" machinery: a reader for the kernel test data the Rust build writes (`just cpp-golden`), header/shader lint gates, and CI jobs that build both languages on the same machine and compare them. Sub-project 1a plan A then landed the first ported library, `sapient::core` (`cpp/libs/sapient-core/`: `Tensor`/`DType`/`Shape`/`Buffer`/`f16`/the shared dequantiser) plus `sapient::testing`'s compare helpers, plan C added `sapient::backends_cpu`'s dense kernels (`cpp/libs/sapient-backends-cpu/`: attention, RoPE, norms, softmax, reductions, conv2d and the float matmul paths, with a rayon stand-in and an own SGEMM), plan D its quantized kernels (`kernels/quant`: every Q4_0/Q8_0/K-quant dot product, the int8 activation quantisers, the NEON/SDOT/SMMLA and R4 kernels, and the quantized arms of `matmul_nt`), plan E its two decode-hot-path support modules: `thermal` (the `ThermalGovernor` — sysfs hysteresis + an external 4-level cap for mobile) and `spinpool` (the seqlock-based worker pool that `matmul_nt`'s `for_each_out_chunk` now dispatches through instead of the rayon stand-in whenever `spinpool::enabled()`), both real ports replacing plan C's stub signatures, and plan B added `sapient::io` (`cpp/libs/sapient-io/`: reading GGUF and safetensors files, either copied into memory or memory-mapped so the OS pages weights in on demand — the GGUF header parser, all three tensor-loading paths, Q5_0→Q8_0 requantisation for a type SAPIENT can't keep quantized, and the safetensors JSON loader), closing out sub-project 1a. The golden-dump/unit-test gates on all of these are bit-identical to the Rust oracle (with the spin-pool route proven bit-identical to the rayon-stand-in route too), except the SGEMM-backed paths (held within a tolerance) and io's error-text-parity gates (byte-identical `Result` messages, generated from a live Rust probe rather than recalled); io additionally carries an env-gated real-file check (`SAPIENT_TEST_GGUF`/`SAPIENT_TEST_SAFETENSORS`, skipped cleanly when unset) that diffs a real downloaded model's heap/mmap/metadata-only loads byte-for-byte. The forward engines follow with sub-project 1b (see `docs/ROADMAP.md` Phase 7 and `docs/PARITY.md`).
 
 ---
 
