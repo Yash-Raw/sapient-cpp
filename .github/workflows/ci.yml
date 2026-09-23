@@ -310,4 +310,7 @@ jobs:
           SAPIENT_TEST_GGUF="$GGUF" ctest --preset ${{ matrix.preset }} \
             -R '^RealFile\.gguf_heap_and_mmap_agree$' -V | tee "$RUNNER_TEMP/realfile.log"
           grep -q "\[real-file\]" "$RUNNER_TEMP/realfile.log"
-          ! grep -q "SAPIENT_TEST_GGUF unset" "$RUNNER_TEMP/realfile.log"
+          if grep -q "SAPIENT_TEST_GGUF unset" "$RUNNER_TEMP/realfile.log"; then
+            echo "real-file test skipped" >&2
+            exit 1
+          fi

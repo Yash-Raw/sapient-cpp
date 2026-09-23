@@ -717,8 +717,8 @@ TEST(GgufLoader, duplicate_tensor_names_last_wins) {
 }
 
 TEST(GgufLoader, mmap_tensor_outlives_the_loader) {
-    TempDir dir(
-        "outlives"); // declared first → destroyed last (Windows cannot delete a mapped file)
+    // declared first → destroyed last (Windows cannot delete a mapped file)
+    TempDir dir("outlives");
     const GgufBuilder b = fixture();
     const auto p = dir.write("o.gguf", b.build());
     std::optional<Tensor> keep;
@@ -864,3 +864,86 @@ TEST(GgufLoader, directory_wrapping_per_entry_point) {
               md.substr(std::string("GGUF parse error: mmap failed for header read: ").size()));
 }
 #endif
+
+// ═════════════════════════════════════ Fix round 1 ══════════════════════════════════════════
+// I1: dequantize_to_f32's F32/F16/BF16 arms must return Err (ShapeMismatch via Tensor::from_f32),
+// never abort, where Rust's wrapping-multiply range lands <= the byte slice — Rust only panics
+// when the wrapped range truly exceeds the slice. `numel * type_size` wraps the SAME way in
+// `tensor_byte_len`, so `raw`'s actual byte count always equals the wrapped `n` computed inside
+// `dequantize_to_f32` for these three cases; the mismatch surfaces one level up, in `from_f32`.
+TEST(GgufTensorsFix1, wrapped_float_numel_is_shape_mismatch_not_abort) {
+    struct Case {
+        const char* name;
+        detail::GgmlType kind;
+        uint32_t ggml_code;
+        std::vector<uint64_t> dims;
+        std::vector<uint8_t> data;
+        std::string want; // full error text
+    };
+    const Case cases[] = {
+        {"f32_tail_one",
+         detail::GgmlType::F32,
+         0,
+         {(1ull << 62) + 1},
+         le_f32({0.0f}),
+         "GGUF parse error: Shape mismatch: expected [4611686018427387905], got [1]"},
+        {"f32_tail_zero",
+         detail::GgmlType::F32,
+         0,
+         {1ull << 62},
+         {},
+         "GGUF parse error: Shape mismatch: expected [4611686018427387904], got [0]"},
+        {"f16_tail_one",
+         detail::GgmlType::F16,
+         1,
+         {(1ull << 63) + 1},
+         le_u16({0x3C00}),
+         "GGUF parse error: Shape mismatch: expected [9223372036854775809], got [1]"},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        TempDir dir("wrapfloat");
+        GgufBuilder b;
+        b.tensor(c.name, c.dims, c.ggml_code, c.data);
+        const auto bytes = b.build();
+        const auto p = dir.write("w.gguf", bytes);
+        for (const Route r : {Route::Heap, Route::Mmap, Route::Bytes}) {
+            const auto m = load(r, p, bytes);
+            ASSERT_FALSE(m.has_value()) << route_name(r);
+            EXPECT_EQ(m.error().to_string(), c.want) << route_name(r);
+        }
+    }
+}
+
+TEST(GgufTensorsFix1, dequantize_to_f32_f32_empty_is_empty_vector) {
+    const auto r = detail::dequantize_to_f32(detail::GgmlType::F32, {}, 0);
+    ASSERT_TRUE(r.has_value()) << r.error().to_string();
+    EXPECT_TRUE(r->empty());
+}
+
+// I2: make_tensor_mmap's KEPT branch (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) never slices at load time in
+// Rust — a wrapped data range that lands <= file size loads Ok, and the wrap panic is deferred
+// to the first read of the tensor's bytes (MmapBuffer::bytes()), not to load_tensors_mmap.
+TEST(GgufTensorsFix2, kept_mmap_wrapped_range_panics_on_first_read_not_load) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TempDir dir(
+        "keptwrap"); // declared first → destroyed last (Windows cannot delete a mapped file)
+    GgufBuilder b;
+    b.tensor("w", {32}, 8, std::vector<uint8_t>(34)); // Q8_0, 1 block = 34 bytes
+    const auto probe = b.build();
+    const size_t ds = detail::parse_header(probe)->data_start;
+    // Same technique as wrapped_range_panics_like_rust_slice: offset wraps `start` down near
+    // 2^64, so start + 34 wraps back to <= file size — the load-time file-size check passes.
+    b.tensors[0].offset_override = std::numeric_limits<uint64_t>::max() - 1 - ds;
+    const auto bytes = b.build();
+    const auto p = dir.write("kw.gguf", bytes);
+    std::optional<Tensor> t;
+    {
+        auto m = GgufLoader::load_tensors_mmap(p);
+        ASSERT_TRUE(m.has_value()) << m.error().to_string();
+        t = m->second.at("w");
+    } // `t` now holds the only handle to its MmapBuffer, so bytes() reaches the buffer
+    ASSERT_TRUE(t->is_mmap());
+    EXPECT_DEATH((void)t->bytes(), "slice index starts at");
+    t.reset();
+}

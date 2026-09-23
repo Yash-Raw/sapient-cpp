@@ -508,16 +508,27 @@ core::Result<std::vector<float>>
 dequantize_to_f32(GgmlType kind, std::span<const uint8_t> bytes, size_t numel) {
     switch (kind) {
     case GgmlType::F32: {
-        if (numel > bytes.size() / 4) core::panic("range end index out of range for slice");
-        std::vector<float> out(numel);
-        std::memcpy(out.data(), bytes.data(), numel * 4);
+        // `&bytes[..numel * 4]` (gguf.rs:478-492): the multiply WRAPS like Rust release, so a
+        // huge `numel` can wrap `n` down to <= bytes.size() and decode fewer than `numel` floats
+        // — the caller's `Tensor::from_f32` then reports ShapeMismatch, not a panic (I1 fix).
+        const size_t n = numel * 4; // wraps like Rust release
+        if (n > bytes.size())
+            core::panic("range end index " + std::to_string(n) +
+                        " out of range for slice of length " + std::to_string(bytes.size()));
+        const size_t count = n / 4;
+        std::vector<float> out(count);
+        if (count > 0) std::memcpy(out.data(), bytes.data(), n);
         return out;
     }
     case GgmlType::F16:
     case GgmlType::BF16: {
-        if (numel > bytes.size() / 2) core::panic("range end index out of range for slice");
-        std::vector<float> out(numel);
-        for (size_t i = 0; i < numel; ++i)
+        const size_t n = numel * 2; // wraps like Rust release
+        if (n > bytes.size())
+            core::panic("range end index " + std::to_string(n) +
+                        " out of range for slice of length " + std::to_string(bytes.size()));
+        const size_t count = n / 2;
+        std::vector<float> out(count);
+        for (size_t i = 0; i < count; ++i)
             out[i] = kind == GgmlType::F16 ? core::f16_le_to_f32(bytes.data() + 2 * i)
                                            : core::bf16_le_to_f32(bytes.data() + 2 * i);
         return out;
@@ -541,6 +552,20 @@ dequantize_to_f32(GgmlType kind, std::span<const uint8_t> bytes, size_t numel) {
 }
 
 // ── MmapBuffer / make_tensor(_mmap) (gguf.rs:38-78, 580-676) ─────────────────────────────────
+std::span<const uint8_t> MmapBuffer::bytes() const {
+    // `&self.mmap[self.offset..self.offset + self.len]` (gguf.rs:55-57): bounds-checked like
+    // Rust's slice indexing (I2 fix) — the KEPT branch of make_tensor_mmap defers a wrapped
+    // range's panic to here instead of panicking at load time.
+    const size_t end = offset_ + len_; // wraps like Rust release
+    if (end < offset_)
+        core::panic("slice index starts at " + std::to_string(offset_) + " but ends at " +
+                    std::to_string(end));
+    if (end > mmap_->size())
+        core::panic("range end index " + std::to_string(end) +
+                    " out of range for slice of length " + std::to_string(mmap_->size()));
+    return mmap_->bytes().subspan(offset_, len_);
+}
+
 std::span<uint8_t> MmapBuffer::bytes_mut() {
     core::panic("MmapBuffer is read-only \xE2\x80\x94 model weights cannot be mutated in-place");
 }
@@ -569,16 +594,23 @@ struct Range {
     size_t end;
 };
 
-core::Result<Range>
-data_range(const GgufTensorInfo& info, size_t data_start, size_t byte_len, size_t file_len) {
+/// `panic_on_wrap` is true for every caller that slices the bytes immediately after this check
+/// (heap make_tensor, the mmap UNKEPT branch) — there, a wrapped `end` passes Rust's file-size
+/// check and then the immediate slice panics (spec §3 rule 8). It is false for the mmap KEPT
+/// branch, which never slices at load time in Rust (gguf.rs:580-615): that branch's wrapped-range
+/// panic is deferred to `MmapBuffer::bytes()` instead (I2 fix).
+core::Result<Range> data_range(const GgufTensorInfo& info,
+                               size_t data_start,
+                               size_t byte_len,
+                               size_t file_len,
+                               bool panic_on_wrap = true) {
     const size_t start = data_start + static_cast<size_t>(info.offset); // wraps like Rust release
-    const size_t end = start + byte_len;
+    const size_t end = start + byte_len;                                // wraps like Rust release
     if (end > file_len)
         return tl::unexpected(core::Error::gguf_parse(
             "tensor '" + info.name + "': data range [" + std::to_string(start) + ".." +
             std::to_string(end) + "] exceeds file size " + std::to_string(file_len)));
-    // A wrapped `end` passes Rust's check and then the slice panics (spec §3 rule 8).
-    if (end < start)
+    if (panic_on_wrap && end < start)
         core::panic("slice index starts at " + std::to_string(start) + " but ends at " +
                     std::to_string(end));
     return Range{start, end};
@@ -615,9 +647,15 @@ core::Result<core::Tensor> make_tensor_mmap(const GgufTensorInfo& info,
                                             size_t data_start) {
     const size_t numel = numel_of(info.dims);
     const size_t byte_len = tensor_byte_len(info.kind, numel);
-    SAPIENT_TRY_ASSIGN(const Range r, data_range(info, data_start, byte_len, mmap->size()));
+    const auto dtype = to_sapient_dtype(info.kind);
+    // The KEPT branch (dtype has a value) never slices at load time in Rust, so a wrapped range
+    // must not panic here — only the file-size Err is checked; the wrap panic is deferred to
+    // MmapBuffer::bytes() (I2 fix). The UNKEPT branch slices `mmap->bytes()` immediately below,
+    // like heap make_tensor, so it keeps the load-time wrap panic.
+    SAPIENT_TRY_ASSIGN(const Range r,
+                       data_range(info, data_start, byte_len, mmap->size(), !dtype.has_value()));
     core::Shape shape = shape_of(info.dims);
-    if (const auto dtype = to_sapient_dtype(info.kind)) {
+    if (dtype) {
         // Zero-copy: MmapBuffer.offset = data_start + info.offset, Tensor.offset = 0 (Rust's
         // two-level offset).
         auto buf = std::make_shared<MmapBuffer>(mmap, r.start, byte_len);

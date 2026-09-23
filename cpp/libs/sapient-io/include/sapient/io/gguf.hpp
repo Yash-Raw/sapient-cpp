@@ -206,9 +206,10 @@ class MmapBuffer final : public core::Buffer {
 public:
     MmapBuffer(std::shared_ptr<const MappedFile> mmap, size_t offset, size_t len)
         : mmap_(std::move(mmap)), offset_(offset), len_(len) {}
-    std::span<const uint8_t> bytes() const override {
-        return mmap_->bytes().subspan(offset_, len_);
-    }
+    /// `&self.mmap[self.offset..self.offset + self.len]` (gguf.rs:55-57) — bounds-checked like
+    /// Rust's slice indexing, not an unchecked `subspan`: the KEPT branch of `make_tensor_mmap`
+    /// defers a wrapped range's panic to here (I2 fix; out of line in gguf.cpp).
+    std::span<const uint8_t> bytes() const override;
     std::span<uint8_t> bytes_mut() override;
     size_t len() const override { return len_; }
     bool is_mmap() const override { return true; }
