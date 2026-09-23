@@ -22,3 +22,12 @@ FetchContent_Declare(tl_expected
 set(EXPECTED_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(EXPECTED_BUILD_PACKAGE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tl_expected)
+
+# nlohmann/json — JSON for the safetensors header now (sub-project 1a plan B), config.json /
+# tokenizer.json later (1b). MIT. The release tarball (no tests, ~200 KB) instead of a git clone.
+FetchContent_Declare(nlohmann_json
+  URL      https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+set(JSON_Install OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)

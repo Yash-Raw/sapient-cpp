@@ -10,12 +10,12 @@ copyleft-incompatible or bundles its own model weights. `NOTICE` points here.
 |---|---|---|---|---|
 | GoogleTest | v1.15.2 | BSD-3-Clause | unit tests (`SAPIENT_BUILD_TESTS` only, not shipped) | `cmake/deps.cmake` |
 | tl::expected (TartanLlama) | v1.1.0 | CC0-1.0 | `sapient::core::Result<T>` until std::expected | `cmake/deps.cmake` |
+| nlohmann/json | v3.11.3 | MIT | safetensors header (1a plan B); config.json / tokenizer.json / HTTP bodies later | `cmake/deps.cmake` |
 
 ## Planned (spec §D4 — add the row when the pin lands, not before)
 
 | Component | Licence | Used for | Sub-project |
 |---|---|---|---|
-| nlohmann/json | MIT | config.json / tokenizer.json / HTTP bodies | 1b |
 | PCRE2 | BSD-3-Clause | tokenizer pre-tokenizer regexes | 1b |
 | minja (ggml-org) | MIT | Jinja chat templates | 1b |
 | CLI11 | BSD-3-Clause | CLI parsing | 3 |

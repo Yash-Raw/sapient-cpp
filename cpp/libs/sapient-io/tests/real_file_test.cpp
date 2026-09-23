@@ -13,6 +13,7 @@
 
 #include "sapient/core/dtype.hpp"
 #include "sapient/io/gguf.hpp"
+#include "sapient/io/safetensors.hpp"
 
 using sapient::io::gguf::GgufLoader;
 
@@ -65,4 +66,25 @@ TEST(RealFile, gguf_heap_and_mmap_agree) {
                 n_mmap,
                 n_requant,
                 heap->first.size());
+}
+
+TEST(RealFile, safetensors_loads) {
+    const char* env = std::getenv("SAPIENT_TEST_SAFETENSORS");
+    if (env == nullptr || *env == '\0') GTEST_SKIP() << "SAPIENT_TEST_SAFETENSORS unset";
+    const std::filesystem::path p(env);
+    std::error_code ec;
+    ASSERT_TRUE(std::filesystem::is_regular_file(p, ec))
+        << "SAPIENT_TEST_SAFETENSORS=" << env << " is not a readable file";
+    auto m = sapient::io::safetensors::SafetensorsLoader::load(p);
+    ASSERT_TRUE(m.has_value()) << m.error().to_string();
+    ASSERT_FALSE(m->empty());
+    for (const auto& [name, t] : *m) {
+        SCOPED_TRACE(name);
+        EXPECT_FALSE(t.is_mmap());
+        const auto dt = t.dtype();
+        EXPECT_TRUE(dt == sapient::core::DType::F32 || dt == sapient::core::DType::F16 ||
+                    dt == sapient::core::DType::BF16);
+        EXPECT_EQ(t.bytes().size(), sapient::core::byte_count(dt, t.numel()));
+    }
+    std::printf("[real-file] %s: %zu tensors\n", env, m->size());
 }
