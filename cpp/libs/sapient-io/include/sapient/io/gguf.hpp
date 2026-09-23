@@ -115,7 +115,7 @@ inline constexpr uint32_t GGUF_MAGIC = 0x46554747; // "GGUF"
 inline constexpr uint64_t DEFAULT_ALIGNMENT = 32;
 inline constexpr size_t QK_K = 256;
 
-enum class GgmlType : uint32_t {
+enum class GgmlType : uint8_t {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,

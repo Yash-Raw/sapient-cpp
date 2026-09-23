@@ -204,8 +204,8 @@ TEST(GgufHeader, duplicate_keys_last_wins) {
 TEST(GgufHeader, tensor_infos_keep_gguf_dim_order) {
     GgufBuilder b;
     b.kv_str("general.architecture", "llama");
-    b.tensor("w", {64, 32}, 8, std::vector<uint8_t>(64 * 32 / 32 * 34));
-    b.tensor("n", {32}, 0, std::vector<uint8_t>(32 * 4));
+    b.tensor("w", {64, 32}, 8, std::vector<uint8_t>(size_t{64} * 32 / 32 * 34));
+    b.tensor("n", {32}, 0, std::vector<uint8_t>(size_t{32} * 4));
     const auto hb = b.header_bytes();
     const auto h = detail::parse_header(hb);
     ASSERT_TRUE(h.has_value()) << h.error().to_string();
@@ -214,7 +214,7 @@ TEST(GgufHeader, tensor_infos_keep_gguf_dim_order) {
     EXPECT_EQ(h->tensor_infos[0].dims, (std::vector<size_t>{64, 32})); // [in, out] — no flip here
     EXPECT_EQ(h->tensor_infos[0].kind, detail::GgmlType::Q8_0);
     EXPECT_EQ(h->tensor_infos[0].offset, 0u);
-    EXPECT_EQ(h->tensor_infos[1].offset, GgufBuilder::align_up(64 * 32 / 32 * 34, 32));
+    EXPECT_EQ(h->tensor_infos[1].offset, GgufBuilder::align_up(size_t{64} * 32 / 32 * 34, 32));
     EXPECT_EQ(h->data_start, GgufBuilder::align_up(hb.size(), 32));
 }
 

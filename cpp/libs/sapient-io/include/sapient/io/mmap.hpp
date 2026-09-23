@@ -26,7 +26,7 @@ struct OsError {
 };
 
 /// `File::open` (Open) vs `Mmap::map` (Map — includes the fstat for the length).
-enum class MapStage { Open, Map };
+enum class MapStage : uint8_t { Open, Map };
 struct MapError {
     MapStage stage{MapStage::Open};
     OsError os;
