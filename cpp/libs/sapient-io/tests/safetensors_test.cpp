@@ -66,6 +66,13 @@ TEST(Safetensors, loads_f32_and_keeps_half_types_raw) {
     EXPECT_EQ(f32_of(a), (std::vector<float>{1.5f, -2.0f}));
     EXPECT_EQ(a.buffer().alignment(), 64u); // Rust Tensor::from_f32
     EXPECT_FALSE(a.is_mmap());
+    const auto& ht = m->at("h");
+    EXPECT_EQ(ht.dtype(), DType::F16);
+    EXPECT_EQ(ht.to_f32_vec(), (std::vector<float>{1.0f, -2.0f}));
+    const auto& bt = m->at("b");
+    EXPECT_EQ(bt.dtype(), DType::BF16);
+    EXPECT_EQ(bt.shape().dims, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(bt.to_f32_vec(), (std::vector<float>{1.0f, -1.5f}));
 }
 
 TEST(Safetensors, half_types_stay_raw) {
@@ -114,6 +121,18 @@ TEST(Safetensors, duplicate_keys_last_wins) {
                                          le_f32({1.0f, 2.0f})));
     ASSERT_TRUE(m.has_value()) << m.error().to_string();
     EXPECT_EQ(f32_of(m->at("a")), (std::vector<float>{2.0f}));
+}
+
+TEST(Safetensors, seq_form_stmeta_decodes_positionally) {
+    // serde's derive(Deserialize) accepts StMeta as a JSON array of its 3 fields in declaration
+    // order (dtype, shape, data_offsets), not just as an object — verified against real
+    // serde_json 1.0.150 via `from_value::<StMeta>(json!(["F32",[1],[0,4]]))` => Ok.
+    const auto m = SafetensorsLoader::from_bytes(st(R"({"a":["F32",[1],[0,4]]})", le_f32({7.5f})));
+    ASSERT_TRUE(m.has_value()) << m.error().to_string();
+    const auto& a = m->at("a");
+    EXPECT_EQ(a.dtype(), DType::F32);
+    EXPECT_EQ(a.shape().dims, (std::vector<size_t>{1}));
+    EXPECT_EQ(f32_of(a), (std::vector<float>{7.5f}));
 }
 
 TEST(Safetensors, header_errors_match_rust) {
@@ -167,7 +186,8 @@ TEST(Safetensors, strict_stmeta_decoding_prefix_only) {
         R"({"a":{"shape":[1],"data_offsets":[0,4]}})",
         R"({"a":{"dtype":5,"shape":[1],"data_offsets":[0,4]}})",
         R"({"a":{"dtype":"F32","shape":"1","data_offsets":[0,4]}})",
-        R"({"a":[1,2]})",
+        R"({"a":["F32",[1]]})",         // seq form, 2 elements (too few)
+        R"({"a":["F32",[1],[0,4],5]})", // seq form, 4 elements (too many)
     };
     for (const char* h : bad_entries)
         EXPECT_TRUE(err(st(h, four)).starts_with("Safetensors parse error: tensor 'a': ")) << h;
@@ -175,6 +195,66 @@ TEST(Safetensors, strict_stmeta_decoding_prefix_only) {
         const std::string e = err(st(h, four));
         EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << h;
         EXPECT_NE(e, "<ok>") << h;
+    }
+}
+
+TEST(Safetensors, bom_prefixed_header_is_rejected) {
+    // serde_json rejects a leading UTF-8 BOM outright ("expected value at line 1 column 1");
+    // nlohmann's lexer silently skips it — verified against real serde_json 1.0.150.
+    const std::string header =
+        std::string("\xEF\xBB\xBF") + R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+    const auto four = std::vector<uint8_t>(4, 0);
+    const auto e = err(st(header, four));
+    EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
+    EXPECT_NE(e, "<ok>") << e;
+}
+
+TEST(Safetensors, recursion_depth_at_limit_is_ok_beyond_limit_is_rejected) {
+    // serde_json's recursion limit: the deepest nesting of `{`/`[` compounds (the root container
+    // counts as depth 1) must stay <= 127; depth 128 is Err. Verified empirically against real
+    // serde_json 1.0.150 (a pure `[`*N`]`*N probe: N=127 is Ok, N=128 is Err). Here the nesting
+    // sits under "__metadata__": root object (depth 1) + N brackets -> max depth N+1, so N=126 is
+    // Ok (depth 127) and N=127 is Err (depth 128).
+    auto build = [](size_t n) {
+        std::string h = R"({"__metadata__":)";
+        h.append(n, '[');
+        h.append(n, ']');
+        h += R"(,"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+        return h;
+    };
+    const auto four = std::vector<uint8_t>(4, 0);
+    {
+        const auto m = SafetensorsLoader::from_bytes(st(build(126), four));
+        ASSERT_TRUE(m.has_value()) << m.error().to_string();
+        EXPECT_EQ(f32_of(m->at("a")), (std::vector<float>{0.0f}));
+    }
+    {
+        const auto e = err(st(build(127), four));
+        EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
+        EXPECT_NE(e, "<ok>") << e;
+    }
+}
+
+TEST(Safetensors, recursion_depth_inside_unknown_tensor_field_is_rejected) {
+    // Same limit, but the nesting sits inside an unknown field of a tensor entry: root object
+    // (depth 1) + tensor object "a" (depth 2) + N brackets -> max depth N+2, so N=125 is Ok
+    // (depth 127) and N=126 is Err (depth 128).
+    auto build = [](size_t n) {
+        std::string h = R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"x":)";
+        h.append(n, '[');
+        h.append(n, ']');
+        h += "}}";
+        return h;
+    };
+    const auto four = std::vector<uint8_t>(4, 0);
+    {
+        const auto m = SafetensorsLoader::from_bytes(st(build(125), four));
+        ASSERT_TRUE(m.has_value()) << m.error().to_string();
+    }
+    {
+        const auto e = err(st(build(126), four));
+        EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
+        EXPECT_NE(e, "<ok>") << e;
     }
 }
 
@@ -194,19 +274,24 @@ TEST(Safetensors, malformed_ranges_panic_like_rust_slices) {
 TEST(Safetensors, empty_file_is_too_short) {
     TempDir dir("st_empty");
     const auto p = dir.write("e.safetensors", {});
-    EXPECT_EQ(SafetensorsLoader::load(p).error().to_string(),
-              "Safetensors parse error: file too short");
+    const auto r = SafetensorsLoader::load(p);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().to_string(), "Safetensors parse error: file too short");
 }
 
 TEST(Safetensors, missing_file_and_directory) {
     TempDir dir("st_missing");
     const auto p = dir.path() / "missing.safetensors";
-    EXPECT_EQ(SafetensorsLoader::load(p).error().to_string(),
+    const auto r = SafetensorsLoader::load(p);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().to_string(),
               "Model not found at path '" + sapient::io::display_path(p) + ": " +
                   sapient::io::rust_std::os_error_message(2) + "'");
 #if !defined(_WIN32)
     // A directory opens and fails at mmap: SafetensorsParseError(e.to_string()) — NO prefix.
-    const auto e = SafetensorsLoader::load(dir.path()).error().to_string();
+    const auto dr = SafetensorsLoader::load(dir.path());
+    ASSERT_FALSE(dr.has_value());
+    const auto e = dr.error().to_string();
     EXPECT_TRUE(e.starts_with("Safetensors parse error: ")) << e;
     EXPECT_NE(e.find("(os error "), std::string::npos) << e;
     EXPECT_EQ(e.find("mmap failed"), std::string::npos) << e;

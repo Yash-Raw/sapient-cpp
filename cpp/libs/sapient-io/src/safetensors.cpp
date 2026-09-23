@@ -48,34 +48,108 @@ std::optional<std::string> as_usize(const nlohmann::json& j, size_t& out) {
     return std::nullopt;
 }
 
-/// serde_json::from_value::<StMeta>. Unknown fields are ignored (no deny_unknown_fields). The
-/// messages are C++-authored: only the caller's "tensor '{name}': " prefix is parity-bound.
+// Per-field decoders shared by both StMeta forms below (serde's derive(Deserialize) accepts a
+// struct either as a JSON object with named fields, via visit_map, OR as a JSON array of exactly
+// its fields in declaration order, via visit_seq — verified against real serde_json 1.0.150:
+// `serde_json::from_value::<StMeta>(json!(["F32",[1],[0,4]]))` is `Ok`). The messages are
+// C++-authored: only the caller's "tensor '{name}': " prefix is parity-bound.
+
+std::optional<std::string> decode_dtype_value(const nlohmann::json& dt, std::string& out) {
+    if (!dt.is_string())
+        return std::string("invalid type: ") + dt.type_name() + ", expected a string";
+    out = dt.get<std::string>();
+    return std::nullopt;
+}
+
+std::optional<std::string> decode_shape_value(const nlohmann::json& sh, std::vector<size_t>& out) {
+    if (!sh.is_array())
+        return std::string("invalid type: ") + sh.type_name() + ", expected a sequence";
+    for (const auto& e : sh) {
+        size_t d = 0;
+        if (auto err = as_usize(e, d)) return err;
+        out.push_back(d);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> decode_data_offsets_value(const nlohmann::json& off,
+                                                     std::array<size_t, 2>& out) {
+    if (!off.is_array())
+        return std::string("invalid type: ") + off.type_name() + ", expected an array";
+    if (off.size() != 2)
+        return "invalid length " + std::to_string(off.size()) + ", expected an array of length 2";
+    for (size_t i = 0; i < 2; ++i)
+        if (auto err = as_usize(off[i], out[i])) return err;
+    return std::nullopt;
+}
+
+/// serde_json::from_value::<StMeta>. Unknown fields on the object form are ignored (no
+/// deny_unknown_fields). The sequence form decodes EXACTLY 3 elements positionally
+/// (dtype, shape, data_offsets); any other length is Err.
 std::optional<std::string> decode_meta(const nlohmann::json& v, StMeta& m) {
+    if (v.is_array()) {
+        if (v.size() != 3)
+            return "invalid length " + std::to_string(v.size()) +
+                   ", expected struct StMeta with 3 elements";
+        if (auto err = decode_dtype_value(v[0], m.dtype)) return err;
+        if (auto err = decode_shape_value(v[1], m.shape)) return err;
+        if (auto err = decode_data_offsets_value(v[2], m.data_offsets)) return err;
+        return std::nullopt;
+    }
     if (!v.is_object())
         return std::string("invalid type: ") + v.type_name() + ", expected struct StMeta";
     const auto dt = v.find("dtype");
     if (dt == v.end()) return std::string("missing field `dtype`");
-    if (!dt->is_string())
-        return std::string("invalid type: ") + dt->type_name() + ", expected a string";
-    m.dtype = dt->get<std::string>();
+    if (auto err = decode_dtype_value(*dt, m.dtype)) return err;
     const auto sh = v.find("shape");
     if (sh == v.end()) return std::string("missing field `shape`");
-    if (!sh->is_array())
-        return std::string("invalid type: ") + sh->type_name() + ", expected a sequence";
-    for (const auto& e : *sh) {
-        size_t d = 0;
-        if (auto err = as_usize(e, d)) return err;
-        m.shape.push_back(d);
-    }
+    if (auto err = decode_shape_value(*sh, m.shape)) return err;
     const auto off = v.find("data_offsets");
     if (off == v.end()) return std::string("missing field `data_offsets`");
-    if (!off->is_array())
-        return std::string("invalid type: ") + off->type_name() + ", expected an array";
-    if (off->size() != 2)
-        return "invalid length " + std::to_string(off->size()) + ", expected an array of length 2";
-    for (size_t i = 0; i < 2; ++i)
-        if (auto err = as_usize((*off)[i], m.data_offsets[i])) return err;
+    if (auto err = decode_data_offsets_value(*off, m.data_offsets)) return err;
     return std::nullopt;
+}
+
+/// serde_json rejects a leading UTF-8 BOM outright ("expected value at line 1 column 1");
+/// nlohmann's lexer silently skips it. Verified against real serde_json 1.0.150. Reject it
+/// ourselves before handing the header to nlohmann.
+bool starts_with_bom(std::span<const uint8_t> header) {
+    return header.size() >= 3 && header[0] == 0xEF && header[1] == 0xBB && header[2] == 0xBF;
+}
+
+/// serde_json's default (non "unbounded_depth") build enforces a recursion limit: the deepest
+/// nesting of `{`/`[` compounds, counting the outermost container as depth 1, must stay <= 127 —
+/// depth 128 is `Err("recursion limit exceeded …")`. Verified empirically against real
+/// serde_json 1.0.150 (pure-array probe: 127 deep is Ok, 128 is Err). nlohmann has no such limit,
+/// so this scans the header bytes (already UTF-8-validated) tracking depth outside string
+/// literals, with backslash-escape handling — a full JSON syntax check is not needed, only
+/// bracket/brace depth.
+inline constexpr size_t MAX_JSON_DEPTH = 127;
+
+bool exceeds_recursion_limit(std::span<const uint8_t> header) {
+    size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const uint8_t c : header) {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > MAX_JSON_DEPTH) return true;
+        } else if ((c == '}' || c == ']') && depth > 0) {
+            --depth;
+        }
+    }
+    return false;
 }
 
 /// Rust: `raw.chunks_exact(4)` → Vec<f32> → `Tensor::from_f32` (validate, then count check, then an
@@ -119,9 +193,15 @@ core::Result<TensorMap> SafetensorsLoader::from_bytes(std::span<const uint8_t> b
         core::panic("slice index starts at 8 but ends at " + std::to_string(header_end));
     const auto header = bytes.subspan(8, header_len);
     if (auto e = rust_std::utf8_error(header)) return tl::unexpected(st_err(*e));
+    if (starts_with_bom(header)) return tl::unexpected(st_err("expected value at line 1 column 1"));
+    if (exceeds_recursion_limit(header)) return tl::unexpected(st_err("recursion limit exceeded"));
 
     nlohmann::json root;
-    try { // the only exception in sapient::io — caught here, never crosses the library boundary
+    // The only exception in sapient::io — caught here, never crosses the library boundary. An
+    // uncaught std::bad_alloc (nlohmann::json::exception's base is std::exception, not
+    // std::bad_alloc) would instead terminate the process here — matching Rust, which aborts on
+    // allocation failure rather than returning a Result.
+    try {
         const char* first = reinterpret_cast<const char*>(header.data());
         root = nlohmann::json::parse(first, first + header.size());
     } catch (const nlohmann::json::exception& e) {
@@ -165,23 +245,28 @@ core::Result<TensorMap> SafetensorsLoader::from_bytes(std::span<const uint8_t> b
         const auto raw = data.subspan(start, end - start);
         core::Shape shape(meta.shape);
 
-        core::Result<core::Tensor> t = tl::unexpected(core::Error::internal("unreachable"));
+        // Stores on success, else returns the error — directly from each case, no placeholder.
+        auto store = [&](core::Result<core::Tensor> t) -> std::optional<core::Error> {
+            if (!t) return t.error();
+            tensors.insert_or_assign(name, std::move(*t)); // last wins
+            return std::nullopt;
+        };
         switch (dtype) {
         case core::DType::F32:
-            t = wrap(f32_tensor(raw, std::move(shape)));
+            if (auto e = store(wrap(f32_tensor(raw, std::move(shape))))) return tl::unexpected(*e);
             break;
         case core::DType::BF16:
-            t = wrap(core::Tensor::from_bf16_bytes(raw, std::move(shape)));
+            if (auto e = store(wrap(core::Tensor::from_bf16_bytes(raw, std::move(shape)))))
+                return tl::unexpected(*e);
             break;
         case core::DType::F16:
-            t = wrap(core::Tensor::from_f16_bytes(raw, std::move(shape)));
+            if (auto e = store(wrap(core::Tensor::from_f16_bytes(raw, std::move(shape)))))
+                return tl::unexpected(*e);
             break;
         default:
             return tl::unexpected(st_err("unsupported safetensors dtype '" +
                                          core::to_string(dtype) + "' for tensor '" + name + "'"));
         }
-        if (!t) return tl::unexpected(t.error());
-        tensors.insert_or_assign(name, std::move(*t)); // last wins
     }
     return tensors;
 }
