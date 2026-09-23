@@ -8,6 +8,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,9 +20,11 @@
 #include <variant>
 #include <vector>
 
+#include "sapient/core/buffer.hpp"
 #include "sapient/core/dtype.hpp"
 #include "sapient/core/error.hpp"
 #include "sapient/core/tensor.hpp"
+#include "sapient/io/mmap.hpp"
 
 namespace sapient::io::gguf {
 
@@ -157,6 +161,72 @@ struct ParsedHeader {
 };
 
 core::Result<ParsedHeader> parse_header(std::span<const uint8_t> bytes);
+
+} // namespace detail
+
+/// Rust `pub struct GgufLoader` (gguf.rs:680-778) minus `load -> Graph` (sub-project 8).
+class GgufLoader {
+public:
+    /// Header KV only, via a mapping that is dropped before returning. Zero tensor allocation.
+    static core::Result<GgufMetadata> parse_metadata_only(const std::filesystem::path& path);
+    /// Q4_0/Q8_0/Q4_K/Q5_K/Q6_K are zero-copy views into the mapping (is_mmap()); F32/F16/BF16
+    /// become F32 and Q5_0 becomes Q8_0 on the heap. (Rust's doc comment claims K-quants are
+    /// dequantised here — stale; trust the code.)
+    static core::Result<std::pair<GgufMetadata, TensorMap>>
+    load_tensors_mmap(const std::filesystem::path& path);
+    static core::Result<TensorMap> load_tensors(const std::filesystem::path& path);
+    /// Reads the WHOLE file into the heap, then copies every tensor out (the ~2× peak-RSS path).
+    static core::Result<std::pair<GgufMetadata, TensorMap>>
+    load_tensors_with_metadata(const std::filesystem::path& path);
+    static core::Result<TensorMap> tensors_from_bytes(std::span<const uint8_t> bytes);
+};
+
+namespace detail {
+
+// io's own dequantisers (gguf.rs:259-476) — core's PER-BLOCK arithmetic with io's block
+// counts: Q4_0/Q8_0 run bytes/block_bytes blocks and skip writes past numel; Q5_0 and the
+// K-quants run numel/block_numel blocks. Q5_K is core's per-element form (io's own copy is stale
+// and unreachable — spec §2.1). Returned vectors always have exactly `numel` elements.
+std::vector<float> dequantize_q4_0(std::span<const uint8_t> data, size_t numel);
+std::vector<float> dequantize_q8_0(std::span<const uint8_t> data, size_t numel);
+std::vector<float> dequantize_q5_0(std::span<const uint8_t> data, size_t numel);
+std::vector<float> dequantize_q4_k(std::span<const uint8_t> data, size_t numel);
+std::vector<float> dequantize_q5_k(std::span<const uint8_t> data, size_t numel);
+std::vector<float> dequantize_q6_k(std::span<const uint8_t> data, size_t numel);
+
+/// F32 → ggml Q8_0 blocks (gguf.rs:289-301). A trailing partial chunk is dropped.
+std::vector<uint8_t> quantize_to_q8_0(std::span<const float> data);
+
+/// gguf.rs:478-505. Errors: "unsupported GGUF quantization type {Debug}".
+core::Result<std::vector<float>>
+dequantize_to_f32(GgmlType kind, std::span<const uint8_t> bytes, size_t numel);
+
+/// A read-only window into a MappedFile (gguf.rs:38-78). Holds the mapping alive.
+class MmapBuffer final : public core::Buffer {
+public:
+    MmapBuffer(std::shared_ptr<const MappedFile> mmap, size_t offset, size_t len)
+        : mmap_(std::move(mmap)), offset_(offset), len_(len) {}
+    std::span<const uint8_t> bytes() const override {
+        return mmap_->bytes().subspan(offset_, len_);
+    }
+    std::span<uint8_t> bytes_mut() override;
+    size_t len() const override { return len_; }
+    bool is_mmap() const override { return true; }
+    size_t alignment() const override { return 32; } // hard-coded GGUF default, as in Rust
+    std::string_view device() const override { return "cpu-mmap"; }
+    size_t offset() const { return offset_; }
+
+private:
+    std::shared_ptr<const MappedFile> mmap_;
+    size_t offset_;
+    size_t len_;
+};
+
+core::Result<core::Tensor>
+make_tensor(const GgufTensorInfo& info, std::span<const uint8_t> bytes, size_t data_start);
+core::Result<core::Tensor> make_tensor_mmap(const GgufTensorInfo& info,
+                                            const std::shared_ptr<const MappedFile>& mmap,
+                                            size_t data_start);
 
 } // namespace detail
 } // namespace sapient::io::gguf

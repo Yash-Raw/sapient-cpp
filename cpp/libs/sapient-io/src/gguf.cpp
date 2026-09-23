@@ -2,9 +2,14 @@
 // Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
 #include "sapient/io/gguf.hpp"
 
+#include <algorithm>
+#include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
 
+#include "sapient/core/dequant.hpp"
+#include "sapient/core/f16.hpp"
 #include "sapient/core/panic.hpp"
 #include "sapient/io/rust_std.hpp"
 
@@ -401,5 +406,292 @@ core::Result<ParsedHeader> parse_header(std::span<const uint8_t> bytes) {
     return h;
 }
 
+// ── Dequantisation (gguf.rs:259-476) ─────────────────────────────────────────────────────────
+namespace {
+
+void require_bytes(std::span<const uint8_t> data, size_t need) {
+    // Rust indexes `data[base..]` unchecked-by-us and panics past the end; never read OOB in C++.
+    if (data.size() < need) core::panic("index out of bounds");
+}
+
+/// io's Q4_0/Q8_0 semantics: bytes/block_bytes blocks, writes past numel skipped.
+template <size_t BlockBytes, void (*Block)(const uint8_t*, float*)>
+std::vector<float> guarded_blocks(std::span<const uint8_t> data, size_t numel) {
+    std::vector<float> out(numel, 0.0f);
+    std::array<float, 32> tmp{};
+    const size_t nblocks = data.size() / BlockBytes;
+    for (size_t b = 0; b < nblocks; ++b) {
+        Block(data.data() + b * BlockBytes, tmp.data());
+        for (size_t j = 0; j < 32; ++j)
+            if (b * 32 + j < numel) out[b * 32 + j] = tmp[j];
+    }
+    return out;
+}
+
+/// io's K-quant semantics: numel/256 blocks written straight into the output.
+template <size_t BlockBytes, void (*Block)(const uint8_t*, float*)>
+std::vector<float> k_blocks(std::span<const uint8_t> data, size_t numel) {
+    const size_t nblocks = numel / QK_K;
+    require_bytes(data, nblocks * BlockBytes);
+    std::vector<float> out(numel, 0.0f);
+    for (size_t b = 0; b < nblocks; ++b)
+        Block(data.data() + b * BlockBytes, out.data() + b * QK_K);
+    return out;
+}
+
+} // namespace
+
+std::vector<float> dequantize_q4_0(std::span<const uint8_t> data, size_t numel) {
+    return guarded_blocks<18, core::dequant::q4_0_block>(data, numel);
+}
+std::vector<float> dequantize_q8_0(std::span<const uint8_t> data, size_t numel) {
+    return guarded_blocks<34, core::dequant::q8_0_block>(data, numel);
+}
+
+std::vector<float> dequantize_q5_0(std::span<const uint8_t> data, size_t numel) {
+    const size_t nblocks = numel / 32;
+    require_bytes(data, nblocks * 22);
+    std::vector<float> out(numel, 0.0f);
+    for (size_t b = 0; b < nblocks; ++b) {
+        const uint8_t* base = data.data() + b * 22;
+        const float scale = core::f16_le_to_f32(base);
+        uint32_t qh = 0;
+        std::memcpy(&qh, base + 2, 4);
+        for (uint32_t j = 0; j < 16; ++j) {
+            const uint8_t byte = base[6 + j];
+            const uint32_t xh_0 = ((qh >> j) << 4) & 0x10u;
+            const uint32_t xh_1 = (qh >> (j + 12)) & 0x10u;
+            const int32_t x0 =
+                static_cast<int32_t>(static_cast<uint32_t>(byte & 0x0Fu) | xh_0) - 16;
+            const int32_t x1 = static_cast<int32_t>(static_cast<uint32_t>(byte >> 4) | xh_1) - 16;
+            out[b * 32 + j] = static_cast<float>(x0) * scale;
+            out[b * 32 + j + 16] = static_cast<float>(x1) * scale;
+        }
+    }
+    return out;
+}
+
+std::vector<float> dequantize_q4_k(std::span<const uint8_t> data, size_t numel) {
+    return k_blocks<144, core::dequant::q4_k_block>(data, numel);
+}
+std::vector<float> dequantize_q5_k(std::span<const uint8_t> data, size_t numel) {
+    return k_blocks<176, core::dequant::q5_k_block>(data, numel);
+}
+std::vector<float> dequantize_q6_k(std::span<const uint8_t> data, size_t numel) {
+    return k_blocks<210, core::dequant::q6_k_block>(data, numel);
+}
+
+std::vector<uint8_t> quantize_to_q8_0(std::span<const float> data) {
+    std::vector<uint8_t> out;
+    out.reserve(data.size() / 32 * 34);                  // sized from real data, not a header field
+    for (size_t b = 0; b + 32 <= data.size(); b += 32) { // chunks_exact(32)
+        float amax = 0.0f;
+        for (size_t i = 0; i < 32; ++i)
+            amax = std::fmax(amax, std::fabs(data[b + i])); // f32::max drops NaN
+        const float d = amax / 127.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        uint8_t h[2];
+        core::f16_to_le(core::f32_to_f16_bits(d), h); // RNE
+        out.push_back(h[0]);
+        out.push_back(h[1]);
+        for (size_t i = 0; i < 32; ++i) {
+            // `(v * id).round().clamp(-127.0, 127.0) as i8 as u8`: roundf, clamp, NaN → 0.
+            const float q = std::clamp(std::roundf(data[b + i] * id), -127.0f, 127.0f);
+            const int8_t v = std::isnan(q) ? int8_t{0} : static_cast<int8_t>(q);
+            out.push_back(static_cast<uint8_t>(v));
+        }
+    }
+    return out;
+}
+
+core::Result<std::vector<float>>
+dequantize_to_f32(GgmlType kind, std::span<const uint8_t> bytes, size_t numel) {
+    switch (kind) {
+    case GgmlType::F32: {
+        if (numel > bytes.size() / 4) core::panic("range end index out of range for slice");
+        std::vector<float> out(numel);
+        std::memcpy(out.data(), bytes.data(), numel * 4);
+        return out;
+    }
+    case GgmlType::F16:
+    case GgmlType::BF16: {
+        if (numel > bytes.size() / 2) core::panic("range end index out of range for slice");
+        std::vector<float> out(numel);
+        for (size_t i = 0; i < numel; ++i)
+            out[i] = kind == GgmlType::F16 ? core::f16_le_to_f32(bytes.data() + 2 * i)
+                                           : core::bf16_le_to_f32(bytes.data() + 2 * i);
+        return out;
+    }
+    case GgmlType::Q4_0:
+        return dequantize_q4_0(bytes, numel);
+    case GgmlType::Q5_0:
+        return dequantize_q5_0(bytes, numel);
+    case GgmlType::Q8_0:
+        return dequantize_q8_0(bytes, numel);
+    case GgmlType::Q4_K:
+        return dequantize_q4_k(bytes, numel);
+    case GgmlType::Q5_K:
+        return dequantize_q5_k(bytes, numel);
+    case GgmlType::Q6_K:
+        return dequantize_q6_k(bytes, numel);
+    default:
+        return tl::unexpected(core::Error::gguf_parse("unsupported GGUF quantization type " +
+                                                      std::string(debug_name(kind))));
+    }
+}
+
+// ── MmapBuffer / make_tensor(_mmap) (gguf.rs:38-78, 580-676) ─────────────────────────────────
+std::span<uint8_t> MmapBuffer::bytes_mut() {
+    core::panic("MmapBuffer is read-only \xE2\x80\x94 model weights cannot be mutated in-place");
+}
+
+namespace {
+
+size_t numel_of(const std::vector<size_t>& dims) {
+    size_t n = 1;
+    for (const size_t d : dims)
+        n *= d; // wraps like Rust release
+    return std::max<size_t>(n, 1);
+}
+
+core::Shape shape_of(const std::vector<size_t>& dims) {
+    return dims.empty() ? core::Shape{1} : core::Shape(dims);
+}
+
+/// `e.to_string()` wrapped as GgufParseError — Rust's `.map_err(|e| GgufParseError(e.to_string()))`.
+core::Result<core::Tensor> wrap(core::Result<core::Tensor> r) {
+    if (!r) return tl::unexpected(core::Error::gguf_parse(r.error().to_string()));
+    return r;
+}
+
+struct Range {
+    size_t start;
+    size_t end;
+};
+
+core::Result<Range>
+data_range(const GgufTensorInfo& info, size_t data_start, size_t byte_len, size_t file_len) {
+    const size_t start = data_start + static_cast<size_t>(info.offset); // wraps like Rust release
+    const size_t end = start + byte_len;
+    if (end > file_len)
+        return tl::unexpected(core::Error::gguf_parse(
+            "tensor '" + info.name + "': data range [" + std::to_string(start) + ".." +
+            std::to_string(end) + "] exceeds file size " + std::to_string(file_len)));
+    // A wrapped `end` passes Rust's check and then the slice panics (spec §3 rule 8).
+    if (end < start)
+        core::panic("slice index starts at " + std::to_string(start) + " but ends at " +
+                    std::to_string(end));
+    return Range{start, end};
+}
+
+/// The identical else-branch of make_tensor / make_tensor_mmap: a type SAPIENT does not keep.
+core::Result<core::Tensor>
+convert_unkept(GgmlType kind, std::span<const uint8_t> raw, size_t numel, core::Shape shape) {
+    SAPIENT_TRY_ASSIGN(const std::vector<float> f32_data, dequantize_to_f32(kind, raw, numel));
+    if (block_size(kind) > 1 && numel % 32 == 0) { // in practice: Q5_0 only
+        const std::vector<uint8_t> q8 = quantize_to_q8_0(f32_data);
+        return wrap(core::Tensor::from_quant_bytes(q8, std::move(shape), core::DType::Q8_0));
+    }
+    return wrap(core::Tensor::from_f32(f32_data, std::move(shape))); // align 64 — not from_f32_vec
+}
+
+} // namespace
+
+core::Result<core::Tensor>
+make_tensor(const GgufTensorInfo& info, std::span<const uint8_t> bytes, size_t data_start) {
+    const size_t numel = numel_of(info.dims);
+    const size_t byte_len = tensor_byte_len(info.kind, numel);
+    SAPIENT_TRY_ASSIGN(const Range r, data_range(info, data_start, byte_len, bytes.size()));
+    const auto raw = bytes.subspan(r.start, byte_len);
+    core::Shape shape = shape_of(info.dims);
+    if (const auto dtype = to_sapient_dtype(info.kind))
+        return wrap(
+            core::Tensor::from_quant_bytes(raw, std::move(shape), *dtype)); // copy, align 16
+    return convert_unkept(info.kind, raw, numel, std::move(shape));
+}
+
+core::Result<core::Tensor> make_tensor_mmap(const GgufTensorInfo& info,
+                                            const std::shared_ptr<const MappedFile>& mmap,
+                                            size_t data_start) {
+    const size_t numel = numel_of(info.dims);
+    const size_t byte_len = tensor_byte_len(info.kind, numel);
+    SAPIENT_TRY_ASSIGN(const Range r, data_range(info, data_start, byte_len, mmap->size()));
+    core::Shape shape = shape_of(info.dims);
+    if (const auto dtype = to_sapient_dtype(info.kind)) {
+        // Zero-copy: MmapBuffer.offset = data_start + info.offset, Tensor.offset = 0 (Rust's
+        // two-level offset).
+        auto buf = std::make_shared<MmapBuffer>(mmap, r.start, byte_len);
+        return wrap(core::Tensor::from_buffer(std::move(shape), *dtype, std::move(buf), 0));
+    }
+    return convert_unkept(
+        info.kind, mmap->bytes().subspan(r.start, byte_len), numel, std::move(shape));
+}
+
 } // namespace detail
+
+// ── GgufLoader (gguf.rs:680-778) ─────────────────────────────────────────────────────────────
+namespace {
+
+core::Error open_or_map_error(const std::filesystem::path& path,
+                              const MapError& e,
+                              std::string_view map_prefix) {
+    if (e.stage == MapStage::Open)
+        return core::Error::model_not_found(display_path(path) + ": " + e.os.message);
+    return core::Error::gguf_parse(std::string(map_prefix) + e.os.message);
+}
+
+core::Result<TensorMap> materialise(const detail::ParsedHeader& h, std::span<const uint8_t> bytes) {
+    TensorMap tensors; // no reserve(tensor_count)
+    for (const auto& info : h.tensor_infos) {
+        SAPIENT_TRY_ASSIGN(core::Tensor t, detail::make_tensor(info, bytes, h.data_start));
+        tensors.insert_or_assign(info.name, std::move(t)); // HashMap::insert: last wins
+    }
+    return tensors;
+}
+
+} // namespace
+
+core::Result<GgufMetadata> GgufLoader::parse_metadata_only(const std::filesystem::path& path) {
+    auto m = MappedFile::open(path);
+    if (!m)
+        return tl::unexpected(open_or_map_error(path, m.error(), "mmap failed for header read: "));
+    SAPIENT_TRY_ASSIGN(detail::ParsedHeader h, detail::parse_header((*m)->bytes()));
+    return std::move(h.metadata);
+}
+
+core::Result<std::pair<GgufMetadata, TensorMap>>
+GgufLoader::load_tensors_mmap(const std::filesystem::path& path) {
+    auto m = MappedFile::open(path);
+    if (!m) return tl::unexpected(open_or_map_error(path, m.error(), "mmap failed: "));
+    const std::shared_ptr<const MappedFile>& mmap = *m;
+    SAPIENT_TRY_ASSIGN(detail::ParsedHeader h, detail::parse_header(mmap->bytes()));
+    TensorMap tensors;
+    for (const auto& info : h.tensor_infos) {
+        SAPIENT_TRY_ASSIGN(core::Tensor t, detail::make_tensor_mmap(info, mmap, h.data_start));
+        tensors.insert_or_assign(info.name, std::move(t));
+    }
+    return std::make_pair(std::move(h.metadata), std::move(tensors));
+}
+
+core::Result<TensorMap> GgufLoader::load_tensors(const std::filesystem::path& path) {
+    SAPIENT_TRY_ASSIGN(auto both, load_tensors_with_metadata(path));
+    return std::move(both.second);
+}
+
+core::Result<std::pair<GgufMetadata, TensorMap>>
+GgufLoader::load_tensors_with_metadata(const std::filesystem::path& path) {
+    auto bytes = read_file(path);
+    if (!bytes)
+        return tl::unexpected(
+            core::Error::model_not_found(display_path(path) + ": " + bytes.error().message));
+    SAPIENT_TRY_ASSIGN(detail::ParsedHeader h, detail::parse_header(*bytes));
+    SAPIENT_TRY_ASSIGN(TensorMap tensors, materialise(h, *bytes));
+    return std::make_pair(std::move(h.metadata), std::move(tensors));
+}
+
+core::Result<TensorMap> GgufLoader::tensors_from_bytes(std::span<const uint8_t> bytes) {
+    SAPIENT_TRY_ASSIGN(const detail::ParsedHeader h, detail::parse_header(bytes));
+    return materialise(h, bytes);
+}
+
 } // namespace sapient::io::gguf

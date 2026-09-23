@@ -301,3 +301,13 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: cpp/tests/parity/greedy_parity.sh --self-check --rust target/release/examples/greedy_ids --model smollm2-135m-q4 --max-new 32
+      - name: Real-file io check (GGUF heap vs mmap, plan B)
+        shell: bash
+        working-directory: cpp
+        run: |
+          GGUF=$(find ~/.cache/huggingface -iname '*smollm2-135m*.gguf' | head -1)
+          test -n "$GGUF" || { echo "parity model GGUF not found in the HF cache" >&2; exit 1; }
+          SAPIENT_TEST_GGUF="$GGUF" ctest --preset ${{ matrix.preset }} \
+            -R '^RealFile\.gguf_heap_and_mmap_agree$' -V | tee "$RUNNER_TEMP/realfile.log"
+          grep -q "\[real-file\]" "$RUNNER_TEMP/realfile.log"
+          ! grep -q "SAPIENT_TEST_GGUF unset" "$RUNNER_TEMP/realfile.log"
