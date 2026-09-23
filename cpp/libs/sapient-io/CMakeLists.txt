@@ -3,14 +3,14 @@
 # Port of crates/sapient-io (sub-project 1a plan B). `mmap` stands in for memmap2 + std::fs::read,
 # `rust_std` for the Rust-std error texts the loaders embed. ONNX and the Graph entry points are
 # sub-project 8.
-add_library(sapient_io STATIC src/rust_std.cpp src/mmap.cpp)
+add_library(sapient_io STATIC src/rust_std.cpp src/mmap.cpp src/gguf.cpp)
 add_library(sapient::io ALIAS sapient_io)
 target_include_directories(sapient_io PUBLIC include)
 target_link_libraries(sapient_io PUBLIC sapient::core)
 sapient_apply_warnings(sapient_io)
 
 if(SAPIENT_BUILD_TESTS)
-  add_executable(sapient_io_tests tests/rust_std_test.cpp tests/mmap_test.cpp)
+  add_executable(sapient_io_tests tests/rust_std_test.cpp tests/mmap_test.cpp tests/gguf_test.cpp)
   target_include_directories(sapient_io_tests PRIVATE tests)
   target_link_libraries(sapient_io_tests PRIVATE sapient::io GTest::gtest_main)
   sapient_apply_warnings(sapient_io_tests)
