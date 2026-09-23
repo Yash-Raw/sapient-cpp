@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 OpenHorizon Labs Pvt Ltd — SAPIENT: AGPL-3.0-only OR commercial (see LICENSE, NOTICE)
+# Port of crates/sapient-io (sub-project 1a plan B). `mmap` stands in for memmap2 + std::fs::read,
+# `rust_std` for the Rust-std error texts the loaders embed. ONNX and the Graph entry points are
+# sub-project 8.
+add_library(sapient_io STATIC src/rust_std.cpp src/mmap.cpp)
+add_library(sapient::io ALIAS sapient_io)
+target_include_directories(sapient_io PUBLIC include)
+target_link_libraries(sapient_io PUBLIC sapient::core)
+sapient_apply_warnings(sapient_io)
+
+if(SAPIENT_BUILD_TESTS)
+  add_executable(sapient_io_tests tests/rust_std_test.cpp tests/mmap_test.cpp)
+  target_include_directories(sapient_io_tests PRIVATE tests)
+  target_link_libraries(sapient_io_tests PRIVATE sapient::io GTest::gtest_main)
+  sapient_apply_warnings(sapient_io_tests)
+  gtest_discover_tests(sapient_io_tests)
+endif()
