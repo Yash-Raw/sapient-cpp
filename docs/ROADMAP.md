@@ -552,7 +552,7 @@ Convert the whole workspace from Rust to C++ **as it is** (behavioural parity, n
 | # | Sub-project | Gate | Status |
 |---|---|---|---|
 | 0 | Scaffold + oracle harness (CMake, CI, SPDX gate, golden-dump + greedy-parity scripts) | CI green | implemented on feat/cpp-sp0-scaffold (2026-09-20) — awaiting CI green on the PR |
-| 1a | Core + IO + CPU kernels | 96 unit tests ported; golden dumps bit-identical on arm64 and x86_64 | in progress — plans A (core), C (dense kernels), D (quant kernels) and E (spinpool + thermal governor, `for_each_out_chunk` gated bit-identical pool-on/pool-off) implemented on feat/cpp-sp1a; plan B (io) remaining |
+| 1a | Core + IO + CPU kernels | 96 unit tests ported; golden dumps bit-identical on arm64 and x86_64 | complete — plans A, C, D, E, B implemented on feat/cpp-sp1a; next: sub-project 1b (CPU chat vertical slice) |
 | 1b | Vertical slice: CPU `chat --prompt` | greedy token-identical on qwen2.5-0.5b-q4 / smollm2-135m-q4 / llama-3.2-1b | — |
 | 2 | Phi, Gemma3, MoE, safetensors, speculative decoding | models tests + parity on phi-4-mini, gemma-3-1b | — |
 | 3 | Hub downloader, all CLI commands, `serve` | live TS-SDK smoke + `bench_serve.py` | — |

@@ -26,6 +26,10 @@ section below as the GitHub release body.
 - `cpp/libs/sapient-backends-cpu`: real ports of the decode-hot-path support modules — `thermal` (`ThermalGovernor`: sysfs hysteresis 80/70 °C, floor `max/2`, external 4-level mobile cap) and `spinpool` (the seqlock op-handoff worker pool: guided topology-aware block claiming, macOS QoS pinning) — replacing plan C's stub signatures, with all 6 thermal + 5 spinpool Rust tests ported by name (incl. the `rapid_ops_with_constant_parking` stress reproducer and the `#[ignore]` probe as `DISABLED_pool_speedup_probe`).
 - `matmul::detail::for_each_out_chunk` now dispatches through the spin pool whenever `spinpool::enabled()`, instead of unconditionally through the rayon stand-in; both routes are gated bit-identical to the Rust golden dumps (two new ctest entries re-running plan D's existing dumps with the pool on and off — no new dump cases, no Rust changes). Library-internal only: no new build step, dependency or user-facing surface.
 
+### 🧱 C++ rewrite — sub-project 1a, plan B (sapient::io GGUF + safetensors loaders)
+- `cpp/libs/sapient-io`: the GGUF header parser, all three GGUF tensor-loading paths (heap, mmap, metadata-only) with Q5_0→Q8_0 requantisation, and the safetensors JSON loader ported 1:1, with the 2 Rust tests ported by name plus 68 C++-only synthetic-file tests (70 total) and an env-gated real-file byte-diff check verified against four real HF-cached models. Every `Result`-path error text is byte-identical to the Rust oracle, generated from a live Rust probe rather than recalled; third-party addition nlohmann/json 3.11.3 for the safetensors header.
+- Library-internal only: no user-facing surface change (the C++ binary isn't wired up yet — that's sub-project 1b). Sub-project 1a is complete.
+
 ## [0.6.0] - 2026-07-14
 
 **SAPIENT becomes an agent backend, and goes mobile.**
